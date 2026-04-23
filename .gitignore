@@ -54,6 +54,11 @@ htmlcov/
 logs/
 
 
+# PyInstaller
+*.manifest
+*.spec.bak
+ui_test/Nacho.ico
+
 # Azure credentials cache
 .azure/
 
