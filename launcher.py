@@ -71,12 +71,18 @@ def _build_tray_icon(server_proc: subprocess.Popen):
         return
 
     def _make_icon_image(size: int = 64) -> "Image.Image":
+        ico_path = os.path.join(_base_dir(), "ui_test", "Nacho.ico")
+        if os.path.exists(ico_path):
+            img = Image.open(ico_path)
+            img = img.resize((size, size), Image.LANCZOS).convert("RGBA")
+            return img
+        # Fallback: círculo con las iniciales del producto
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         margin = size // 8
         draw.ellipse(
             [margin, margin, size - margin, size - margin],
-            fill=(59, 130, 246),   # azul
+            fill=(174, 1, 253),   # #ae01fd — púrpura del logo
         )
         return img
 

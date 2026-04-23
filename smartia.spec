@@ -24,7 +24,7 @@ a = Analysis(
     datas=[
         # Carpetas de datos necesarias en runtime
         (str(ROOT / "app"),         "app"),
-        (str(ROOT / "ui_test"),     "ui_test"),
+        (str(ROOT / "ui_test"),     "ui_test"),   # incluye Nacho.ico si fue generado
         (str(ROOT / "context"),     "context"),
         # .env si existe (opcional — el usuario puede editarlo externamente)
         *([( str(ROOT / ".env"), "." )] if (ROOT / ".env").exists() else []),
@@ -94,5 +94,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="ui_test/Nacho.ico",  # descomentar si tenés un .ico
+    icon=str(ROOT / "ui_test" / "Nacho.ico") if (ROOT / "ui_test" / "Nacho.ico").exists() else None,
 )
