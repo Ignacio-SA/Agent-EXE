@@ -313,6 +313,11 @@
               <span class="material-symbols-outlined text-[14px]">add</span>
               Nueva
             </button>
+            <!-- Training mode toggle -->
+            <label class="flex items-center gap-1.5 px-2 py-1.5 cursor-pointer select-none" title="Modo Entrenamiento">
+              <input type="checkbox" id="trainingToggle" class="w-3.5 h-3.5 accent-primary cursor-pointer" />
+              <span class="text-[10px] font-semibold font-label text-on-surface-variant/60">Entrenamiento</span>
+            </label>
           </div>
         </div>
 
@@ -362,12 +367,17 @@
     const messagesContainer = document.getElementById('messages');
     const sendBtn           = document.getElementById('sendBtn');
 
+    let lastUserMessage = '';
+    let lastBotResponse = '';
+
     messageInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
 
     async function sendMessage() {
-      const message = messageInput.value.trim();
+      const message      = messageInput.value.trim();
+      const trainingMode = document.getElementById('trainingToggle').checked;
       if (!message) return;
 
+      lastUserMessage = message;
       messagesContainer.querySelector('.welcome-hint')?.remove();
       messageInput.value = '';
       sendBtn.disabled   = true;
@@ -378,11 +388,12 @@
         const response = await fetch(API_URL, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ message, session_id: SESSION_ID, user_id: 'ui_user' })
+          body:    JSON.stringify({ message, session_id: SESSION_ID, user_id: 'ui_user', training_mode: trainingMode })
         });
         typingEl.remove();
         if (!response.ok) { const err = await response.json(); throw new Error(err.detail || 'API Error'); }
         const data = await response.json();
+        lastBotResponse = data.response;
         addMessage(data.response, 'bot', data.agent_type);
       } catch (error) {
         typingEl.remove();
@@ -392,6 +403,58 @@
         sendBtn.disabled = false;
         messageInput.focus();
       }
+    }
+
+    async function submitFeedback(type, feedbackText) {
+      try {
+        await fetch('http://localhost:8000/chat/feedback/', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            session_id:    SESSION_ID,
+            user_message:  lastUserMessage,
+            bot_response:  lastBotResponse,
+            feedback:      feedbackText,
+            feedback_type: type,
+          }),
+        });
+      } catch(e) { console.error('Feedback error:', e); }
+    }
+
+    function handleThumb(btn, type) {
+      const fbRow = btn.closest('div');
+      if (fbRow.dataset.done) return;
+
+      if (type === 'positivo') {
+        fbRow.dataset.done = '1';
+        fbRow.querySelectorAll('button').forEach(b => b.disabled = true);
+        btn.style.color = '#16a34a';
+        fbRow.querySelector('.fb-note').textContent = '¡Gracias!';
+        fbRow.querySelector('.fb-note').classList.remove('hidden');
+        submitFeedback('positivo', 'La respuesta fue correcta y útil.');
+      } else {
+        // Mostrar input de texto para feedback negativo
+        fbRow.dataset.done = '1';
+        fbRow.querySelectorAll('button').forEach(b => b.disabled = true);
+        btn.style.color = '#dc2626';
+        fbRow.innerHTML += `
+          <div class="flex items-center gap-1 mt-1 w-full">
+            <input id="fb-input" type="text" placeholder="¿Qué falló?" maxlength="200"
+              class="flex-1 text-[11px] font-label bg-surface-container-high border-none rounded-full px-3 py-1 outline-none focus:ring-1 focus:ring-primary/30" />
+            <button onclick="sendNegFeedback()"
+              class="text-[10px] font-semibold font-label px-2.5 py-1 rounded-full transition-colors"
+              style="background:rgba(110,89,238,0.10);color:#6e59ee;">
+              Enviar
+            </button>
+          </div>`;
+      }
+    }
+
+    function sendNegFeedback() {
+      const input = document.getElementById('fb-input');
+      const text  = input?.value.trim() || 'La respuesta no fue correcta.';
+      input?.closest('div')?.remove();
+      submitFeedback('negativo', text);
     }
 
     function addMessage(text, role, agent = '') {
@@ -410,6 +473,24 @@
         badge.style.cssText = 'background:rgba(0,98,103,0.10);color:#006267;border:1px solid rgba(0,98,103,0.18);';
         badge.innerHTML = `<span style="width:5px;height:5px;border-radius:50%;background:#006267;display:inline-block;flex-shrink:0;"></span>Agente: ${agent}`;
         bubble.appendChild(badge);
+      }
+
+      if (role === 'bot') {
+        const fbRow = document.createElement('div');
+        fbRow.className = 'flex items-center gap-1 mt-2';
+        fbRow.innerHTML = `
+          <button onclick="handleThumb(this,'positivo')"
+            class="text-on-surface-variant/30 hover:text-green-600 transition-colors text-[13px] leading-none"
+            title="Buena respuesta">
+            <span class="material-symbols-outlined text-[15px]">thumb_up</span>
+          </button>
+          <button onclick="handleThumb(this,'negativo')"
+            class="text-on-surface-variant/30 hover:text-red-500 transition-colors text-[13px] leading-none"
+            title="Mala respuesta">
+            <span class="material-symbols-outlined text-[15px]">thumb_down</span>
+          </button>
+          <span class="fb-note text-[10px] font-label text-on-surface-variant/40 ml-1 hidden"></span>`;
+        bubble.appendChild(fbRow);
       }
 
       wrap.appendChild(bubble);
@@ -437,7 +518,7 @@
       wrap.innerHTML = `
         <img src="./Nacho.svg" alt="smartfran" class="w-20 h-20 rounded-full object-cover" />
         <p class="font-headline font-bold text-[.85rem] text-center text-on-surface-variant/50">
-          ¡Hola! Ingresá tu Franchise ID y<br>preguntame lo que necesites.
+          ¡Hola! Preguntame lo que necesites<br>sobre tus ventas.
         </p>`;
       messagesContainer.appendChild(wrap);
     }

@@ -20,7 +20,8 @@ class OrchestratorAgent:
 1. "comparative" — consultas que comparan DOS períodos o dimensiones: "esta semana vs la semana pasada", "enero vs febrero", "compará hoy con ayer", "diferencia entre", "cómo fue X comparado con Y".
 2. "data" — consultas de ventas de UN solo período: productos, artículos, precios, turnos, POS, reportes, métricas del negocio.
 3. "interaction" — saludos, preguntas sobre cómo usar el chatbot, conversación mínima relacionada con el negocio.
-4. "off_topic" — SOLO cuando el mensaje NO contiene NINGUNA parte relacionada con ventas o el negocio.
+4. "feedback" — el usuario evalúa o comenta la respuesta anterior del bot: "estuvo mal", "eso es incorrecto", "perfecto", "muy bien", "no era lo que pedí", "la respuesta anterior", "eso no es correcto".
+5. "off_topic" — SOLO cuando el mensaje NO contiene NINGUNA parte relacionada con ventas o el negocio.
 
 REGLA DE PRIORIDAD: Si el mensaje mezcla contenido de negocio con contenido off-topic, clasificar siempre por la parte de negocio e ignorar el resto. "off_topic" es el último recurso.
 Si hay duda entre "comparative" y "data", usar "comparative".

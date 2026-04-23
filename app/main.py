@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .db.memory_repo import init_memory_db
+from .db.training_repo import training_memory  # noqa: F401 — carga el log al iniciar
 from .routers import chat, debug
 
 
