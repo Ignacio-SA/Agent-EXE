@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # Azure AD auth: "sql" | "activedirectoryinteractive" | "activedirectoryintegrated"
     db_auth_mode: str = os.getenv("DB_AUTH_MODE", "sql")
 
+    # Franquicia fija (versión EXE)
+    franchise_code: str = os.getenv("FRANCHISE_CODE", "4066b2def050495a8fc9ff8c0cb3f8f4")
+
     # Memoria local (SQLite) — ruta al archivo .db
     memory_db_path: str = os.getenv("MEMORY_DB_PATH", "./memory.db")
 

@@ -9,6 +9,7 @@ from ..agents.data_agent import data_agent
 from ..agents.interaction import interaction_agent
 from ..agents.memory_agent import memory_agent
 from ..agents.orchestrator import orchestrator
+from ..config import settings
 from ..models.schemas import ChatRequest, ChatResponse, HistoryEntry
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -36,9 +37,9 @@ async def chat(request: ChatRequest):
         # Invocar agente correspondiente
         agent_in = agent_out = 0
         if agent_type == "comparative":
-            response_text, agent_in, agent_out = comparative_agent.process_comparative_request(request.message, request.franchise_id, memory_context, request.session_id)
+            response_text, agent_in, agent_out = comparative_agent.process_comparative_request(request.message, settings.franchise_code, memory_context, request.session_id)
         elif agent_type == "data":
-            response_text, agent_in, agent_out = data_agent.process_data_request(request.message, request.franchise_id, memory_context, request.session_id)
+            response_text, agent_in, agent_out = data_agent.process_data_request(request.message, settings.franchise_code, memory_context, request.session_id)
         elif agent_type == "memory":
             response_text = f"Recordando: {memory_context}"
         elif agent_type == "off_topic":
@@ -60,7 +61,7 @@ async def chat(request: ChatRequest):
             {"role": "user", "content": request.message},
             {"role": "assistant", "content": response_text},
         ]
-        user_id = request.user_id or request.franchise_id
+        user_id = request.user_id or settings.franchise_code
         memory_agent.save_memory(request.session_id, user_id, conversation)
 
         return ChatResponse(

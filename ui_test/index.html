@@ -316,14 +316,6 @@
           </div>
         </div>
 
-        <!-- Franchise ID input -->
-        <div class="relative group">
-          <span class="material-symbols-outlined absolute left-4 top-1/2 -translate-y-1/2 text-on-surface-variant/40 group-focus-within:text-primary transition-colors text-[15px]">badge</span>
-          <input
-            id="franchiseInput" type="text" placeholder="Franchise ID..."
-            class="w-full bg-surface-container-high border-none rounded-full py-2.5 pl-10 pr-4 text-on-background placeholder:text-on-surface-variant/40 focus:ring-2 focus:ring-primary/20 transition-all outline-none text-sm font-label font-medium"
-          />
-        </div>
       </header>
 
       <!-- ══ SESSIONS PANEL ══ -->
@@ -367,21 +359,14 @@
     const API_URL = 'http://localhost:8000/chat/';
 
     const messageInput      = document.getElementById('messageInput');
-    const franchiseInput    = document.getElementById('franchiseInput');
     const messagesContainer = document.getElementById('messages');
     const sendBtn           = document.getElementById('sendBtn');
 
-    franchiseInput.value = localStorage.getItem('franchise_id') || '';
-    franchiseInput.addEventListener('change', () => {
-      localStorage.setItem('franchise_id', franchiseInput.value.trim());
-    });
     messageInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
 
     async function sendMessage() {
-      const message     = messageInput.value.trim();
-      const franchiseId = franchiseInput.value.trim();
+      const message = messageInput.value.trim();
       if (!message) return;
-      if (!franchiseId) { alert('Ingresá tu Franchise ID antes de enviar.'); franchiseInput.focus(); return; }
 
       messagesContainer.querySelector('.welcome-hint')?.remove();
       messageInput.value = '';
@@ -393,7 +378,7 @@
         const response = await fetch(API_URL, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ message, session_id: SESSION_ID, franchise_id: franchiseId, user_id: 'ui_user' })
+          body:    JSON.stringify({ message, session_id: SESSION_ID, user_id: 'ui_user' })
         });
         typingEl.remove();
         if (!response.ok) { const err = await response.json(); throw new Error(err.detail || 'API Error'); }
