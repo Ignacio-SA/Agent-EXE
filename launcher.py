@@ -1,10 +1,13 @@
 """
 Launcher para Smart-IA Agent EXE.
-Inicia uvicorn en background, abre el browser y crea un ícono en la bandeja del sistema.
+Corre uvicorn en un thread del mismo proceso, abre el browser
+y crea un ícono en la bandeja del sistema.
+
+NOTA: No usa subprocess — cuando PyInstaller congela el .exe, sys.executable
+apunta al propio .exe, lo que causaría un bucle infinito de re-lanzamientos.
 """
 import os
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -14,12 +17,44 @@ HOST = "127.0.0.1"
 PORT = 8000
 UI_URL = f"http://{HOST}:{PORT}/ui/index.html"
 
+_stop_event = threading.Event()
+
 
 def _base_dir() -> str:
-    """Devuelve la carpeta raíz del ejecutable o del script."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _start_server_thread():
+    import uvicorn
+    base = _base_dir()
+
+    # Aseguramos que los módulos de la app sean importables
+    if base not in sys.path:
+        sys.path.insert(0, base)
+
+    # Cargar .env si existe junto al .exe
+    env_path = os.path.join(base, ".env")
+    if os.path.exists(env_path):
+        from dotenv import load_dotenv
+        load_dotenv(env_path, override=True)
+
+    config = uvicorn.Config(
+        "app.main:app",
+        host=HOST,
+        port=PORT,
+        log_level="error",
+    )
+    server = uvicorn.Server(config)
+
+    # Paramos el servidor cuando el tray icon hace quit
+    def _watch_stop():
+        _stop_event.wait()
+        server.should_exit = True
+
+    threading.Thread(target=_watch_stop, daemon=True).start()
+    server.run()
 
 
 def _wait_for_server(timeout: int = 30) -> bool:
@@ -29,69 +64,43 @@ def _wait_for_server(timeout: int = 30) -> bool:
             with socket.create_connection((HOST, PORT), timeout=1):
                 return True
         except OSError:
-            time.sleep(0.5)
+            time.sleep(0.3)
     return False
 
 
-def _start_server() -> subprocess.Popen:
-    base = _base_dir()
-    env = os.environ.copy()
-    env["PYTHONPATH"] = base
+def _make_icon_image(size: int = 64):
+    from PIL import Image, ImageDraw
 
-    if getattr(sys, "frozen", False):
-        # Dentro del .exe: uvicorn está empaquetado junto
-        uvicorn_cmd = [sys.executable, "-m", "uvicorn"]
-    else:
-        uvicorn_cmd = [sys.executable, "-m", "uvicorn"]
+    ico_path = os.path.join(_base_dir(), "ui_test", "Nacho.ico")
+    if os.path.exists(ico_path):
+        img = Image.open(ico_path)
+        return img.resize((size, size), Image.LANCZOS).convert("RGBA")
 
-    cmd = uvicorn_cmd + [
-        "app.main:app",
-        "--host", HOST,
-        "--port", str(PORT),
-    ]
-
-    return subprocess.Popen(
-        cmd,
-        cwd=base,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    margin = size // 8
+    draw.rounded_rectangle(
+        [margin, margin, size - margin, size - margin],
+        radius=size // 6,
+        fill=(174, 1, 253),
     )
+    return img
 
 
-def _build_tray_icon(server_proc: subprocess.Popen):
-    """Crea y corre el ícono de bandeja (bloqueante hasta que el usuario cierra)."""
+def _run_tray():
     try:
         import pystray
-        from PIL import Image, ImageDraw
     except ImportError:
-        # Sin pystray simplemente esperamos a que el proceso del servidor termine
-        server_proc.wait()
+        # Sin pystray: simplemente esperar
+        _stop_event.wait()
         return
-
-    def _make_icon_image(size: int = 64) -> "Image.Image":
-        ico_path = os.path.join(_base_dir(), "ui_test", "Nacho.ico")
-        if os.path.exists(ico_path):
-            img = Image.open(ico_path)
-            img = img.resize((size, size), Image.LANCZOS).convert("RGBA")
-            return img
-        # Fallback: círculo con las iniciales del producto
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        margin = size // 8
-        draw.ellipse(
-            [margin, margin, size - margin, size - margin],
-            fill=(174, 1, 253),   # #ae01fd — púrpura del logo
-        )
-        return img
 
     def on_open(icon, item):  # noqa: ARG001
         webbrowser.open(UI_URL)
 
     def on_quit(icon, item):  # noqa: ARG001
+        _stop_event.set()
         icon.stop()
-        server_proc.terminate()
 
     icon = pystray.Icon(
         "SmartIA",
@@ -106,14 +115,15 @@ def _build_tray_icon(server_proc: subprocess.Popen):
 
 
 def main():
-    server = _start_server()
+    # Uvicorn corre en un thread daemon — muere cuando el proceso principal termina
+    server_thread = threading.Thread(target=_start_server_thread, daemon=True)
+    server_thread.start()
 
     if not _wait_for_server(timeout=30):
-        server.terminate()
-        sys.exit("Error: el servidor no levantó a tiempo.")
+        sys.exit("Error: el servidor no levantó en 30 segundos.")
 
     webbrowser.open(UI_URL)
-    _build_tray_icon(server)
+    _run_tray()   # bloqueante hasta que el usuario hace "Salir"
 
 
 if __name__ == "__main__":
