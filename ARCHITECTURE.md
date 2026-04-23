@@ -1,124 +1,118 @@
-# Arquitectura del Chatbot Multi-Agente
+# Arquitectura — Asistente Smart-IA (Agent-EXE)
 
 ## Índice
 1. [Visión general](#1-visión-general)
 2. [Estructura de carpetas](#2-estructura-de-carpetas)
 3. [Flujo de una consulta](#3-flujo-de-una-consulta)
 4. [Componentes en detalle](#4-componentes-en-detalle)
-5. [Bases de datos](#5-bases-de-datos)
-6. [Cómo construirlo desde cero](#6-cómo-construirlo-desde-cero)
+5. [Sistema de entrenamiento](#5-sistema-de-entrenamiento)
+6. [Bases de datos](#6-bases-de-datos)
 7. [Variables de entorno](#7-variables-de-entorno)
-8. [Decisiones de diseño importantes](#8-decisiones-de-diseño-importantes)
+8. [Decisiones de diseño](#8-decisiones-de-diseño)
 
 ---
 
 ## 1. Visión general
 
-El sistema es un chatbot orientado a **franquiciados** que pueden consultar sus datos de ventas en lenguaje natural. El backend es una API FastAPI con un sistema multi-agente donde cada agente tiene una responsabilidad específica.
+Chatbot de ventas para franquiciados con franquicia fija (configurada en `.env`). El backend es una API FastAPI con sistema multi-agente donde cada agente tiene una responsabilidad específica. Incluye un ciclo de entrenamiento supervisado basado en feedback de usuarios.
 
 ```
-Usuario (HTML) ──POST /chat──► Orchestrator ──► Agente correcto ──► Respuesta
+Usuario (UI Web) ──POST /chat──► Orchestrator ──► Agente correcto ──► Respuesta
+                                                                          │
+                               TrainingMemory ◄── Training Agent ◄── Feedback
 ```
-
-El chatbot se conecta a un **Microsoft Fabric Warehouse** para traer datos de ventas, los carga en **SQLite en memoria**, genera SQL con un LLM y formatea la respuesta en lenguaje natural.
 
 ---
 
 ## 2. Estructura de carpetas
 
 ```
-Agent/
-├── app/                          # Código principal de la aplicación
-│   ├── main.py                   # Punto de entrada FastAPI
-│   ├── config.py                 # Variables de entorno (via pydantic-settings)
-│   ├── agents/                   # Los agentes de IA
-│   │   ├── orchestrator.py       # Decide qué agente responde cada mensaje
-│   │   ├── comparative_agent.py  # Comparativas entre dos períodos de ventas
-│   │   ├── data_agent.py         # Consulta y analiza datos de ventas (un período)
-│   │   ├── interaction.py        # Responde conversación general del negocio
-│   │   └── memory_agent.py       # Genera y recupera resúmenes de sesión
-│   ├── routers/
-│   │   ├── chat.py               # Endpoints HTTP de chat y sesiones
-│   │   └── debug.py              # Endpoints de debug (/debug/query/csv y /debug/query/json)
-│   ├── logger.py                 # Logger por sesión → logs/<session_id>.log
+Agent-EXE/
+├── app/
+│   ├── main.py                    # Punto de entrada FastAPI
+│   ├── config.py                  # Variables de entorno + franchise_code fijo
+│   ├── logger.py                  # Logger por sesión → logs/<session_id>.log
+│   ├── agents/
+│   │   ├── orchestrator.py        # Clasifica mensajes en tipos de agente
+│   │   ├── comparative_agent.py   # Comparativas entre dos períodos de ventas
+│   │   ├── data_agent.py          # Text-to-SQL sobre datos de ventas
+│   │   ├── interaction.py         # Conversación general del negocio
+│   │   ├── memory_agent.py        # Resúmenes y contexto de sesión
+│   │   └── training_agent.py      # Analiza feedback, escribe training_log.md
 │   ├── db/
-│   │   ├── connection.py         # Conexión a Fabric Warehouse (pyodbc + Azure AD)
-│   │   ├── sales_repo.py         # Ejecuta el SP de ventas
-│   │   └── memory_repo.py        # CRUD de sesiones y mensajes (SQLite local)
-│   └── models/
-│       ├── schemas.py            # Modelos de request/response (Pydantic)
-│       └── memory.py             # Modelo de la entidad MemoryEntry
+│   │   ├── connection.py          # Conexión Azure AD a Fabric (pyodbc)
+│   │   ├── sales_repo.py          # Ejecuta sp_GetSalesForChatbot
+│   │   ├── memory_repo.py         # CRUD sesiones/mensajes/token-logs (SQLite)
+│   │   └── training_repo.py       # TrainingMemory singleton (RAM + disco)
+│   ├── models/
+│   │   └── schemas.py             # Pydantic: ChatRequest, FeedbackRequest, etc.
+│   └── routers/
+│       ├── chat.py                # POST /chat/, POST /chat/feedback/, sesiones
+│       └── debug.py               # /debug/query/csv, /debug/query/json, token-logs
 ├── context/
-│   └── business_rules.md         # Reglas de negocio que leen los agentes en runtime
+│   ├── business_rules.md          # Reglas de negocio leídas en runtime
+│   └── training_log.md            # Log append-only de sugerencias de mejora
 ├── sql/
-│   ├── sp_GetSalesForChatbot.sql  # Stored Procedure en Fabric Warehouse
-│   └── create_chatbot_memory.sql  # Script auxiliar (referencia)
+│   └── sp_GetSalesForChatbot.sql
 ├── ui_test/
-│   └── index.html                # UI de prueba (chat + panel de sesiones)
-├── logs/                         # Logs por sesión (se crea automáticamente, en .gitignore)
-├── memory.db                     # SQLite local (se crea automáticamente)
-├── .env                          # Variables de entorno (NO commitear)
-├── .env.example                  # Plantilla de variables de entorno
-└── requirements.txt              # Dependencias Python
+│   ├── index.html                 # UI (Tailwind CSS) con feedback 👍👎
+│   └── Nacho.svg
+├── logs/                          # Logs por sesión (auto-generado)
+├── memory.db                      # SQLite local (auto-generado)
+├── .env / .env.example
+└── requirements.txt
 ```
 
 ---
 
 ## 3. Flujo de una consulta
 
-### Paso a paso
-
 ```
-1. Usuario escribe un mensaje en index.html
+1. Usuario escribe en index.html → POST /chat  {message, session_id, training_mode}
         │
         ▼
-2. POST /chat  →  chat.py::chat()
+2. chat.py::chat()
+   ├─ Recupera memoria de sesión (memory_agent.retrieve_memory)
+   └─ Si training_mode=True: inyecta get_context() de TrainingMemory en el contexto
         │
         ▼
-3. OrchestratorAgent.decide_agent(mensaje)
-   ├─ "comparative" → ComparativeAgent
-   ├─ "data"        → DataAgent
-   ├─ "interaction" → InteractionAgent
-   ├─ "off_topic"   → Respuesta fija (sin LLM, 0 tokens de generación)
+3. OrchestratorAgent.decide_agent(mensaje, contexto)
+   ├─ "comparative" → ComparativeAgent.process_comparative_request()
+   ├─ "data"        → DataAgent.process_data_request()
+   ├─ "interaction" → InteractionAgent.respond()
+   ├─ "feedback"    → TrainingAgent.analyze_feedback() + respuesta fija
+   ├─ "off_topic"   → Respuesta fija (0 tokens)
    └─ "memory"      → Devuelve resumen guardado
         │
-        ▼ (si es "data")
-4. DataAgent.process_data_request()
-   │
-   ├─ a) _extract_date_range(user_message, context)
-   │       ├─ Detección Python primero: hoy/ayer/esta semana/semana pasada/este mes
-   │       └─ LLM fallback con contexto de conversación previa inyectado
-   │           └─ Permite "haz un desglose por items" sin repetir la fecha
-   │
-   ├─ b) sales_repo.get_sales(franchise_code, date_from, date_to)
-   │       └─ EXEC sp_GetSalesForChatbot @FranchiseCode=?, @DateFrom=?, @DateTo=?
-   │           └─ Retorna rows del Fabric Warehouse (filtrado por header.DateTimeUtc)
-   │
-   ├─ c) _load_into_memory(sales)
-   │       └─ Crea tabla SQLite en RAM con los datos
-   │           └─ Decodifica DATETIMEOFFSET (20 bytes raw) con struct.unpack
-   │
-   ├─ d) _generate_sql(user_message, total_rows, today, context)
-   │       └─ LLM (Haiku) genera SQL SQLite
-   │           └─ Incluye business_rules.md y contexto de conversación
-   │
-   ├─ e) _execute_sql(conn, sql)
-   │       └─ Ejecuta la consulta sobre SQLite en memoria
-   │
-   ├─ f) _compute_summary(conn, date_filter, period_label)
-   │       └─ Calcula métricas en Python (sin LLM): totales, por vendedor, top productos, horas
-   │           └─ Filtradas por el mismo período que pidió el usuario
-   │
-   └─ g) _format_response(user_message, sql, columns, rows, summary)
-           └─ LLM (Haiku) convierte los resultados a lenguaje natural
-               └─ Usa los números pre-calculados del summary — no recalcula
+        ▼
+4. chat.py guarda mensaje en SQLite (memory_repo) + actualiza resumen (memory_agent)
         │
         ▼
-5. chat.py guarda los mensajes en SQLite local (chat_messages)
-   y actualiza el resumen de sesión (memory_agent.save_memory)
+5. Respuesta JSON → index.html → renderiza con markdown + botones 👍👎
         │
-        ▼
-6. Respuesta JSON → index.html → Renderiza en el chat
+        ▼ (si el usuario presiona 👎 o 👍)
+6. POST /chat/feedback/ → TrainingAgent.analyze_feedback()
+   └─ Escribe entrada estructurada en context/training_log.md
+   └─ Agrega parsed entry a TrainingMemory (RAM, máx 20 entradas)
+```
+
+### Flujo del Data Agent (detalle)
+
+```
+_extract_date_range()       → Python primero (hoy/ayer/esta semana...), LLM fallback
+        │
+sales_repo.get_sales()      → EXEC sp_GetSalesForChatbot con fecha y franchise_code
+        │
+_load_into_memory()         → Tabla SQLite en RAM (decodifica DATETIMEOFFSET 20 bytes)
+        │
+_generate_sql()             → LLM genera SQL SQLite (business_rules + contexto sesión)
+        │
+_execute_sql()              → Ejecuta contra la tabla en RAM
+        │
+_compute_summary()          → Métricas en Python: transacciones, totales, vendedores,
+                              top productos, horas activas — sin LLM
+        │
+_format_response()          → LLM presenta los datos pre-calculados en español
 ```
 
 ---
@@ -127,318 +121,220 @@ Agent/
 
 ### `app/agents/orchestrator.py` — El portero
 
-Usa **Claude Sonnet** para clasificar cada mensaje en una de estas categorías:
+Usa Claude Sonnet para clasificar cada mensaje:
 
 | Tipo | Cuándo | Costo |
 |------|--------|-------|
-| `comparative` | Comparativas entre dos períodos ("esta semana vs la semana pasada") | Medio (2 llamadas LLM) |
-| `data` | Consultas de ventas de un período, productos, precios, reportes | Alto (hasta 3 llamadas LLM) |
-| `interaction` | Saludos, preguntas sobre el chatbot | Bajo (1 llamada LLM, 200 tokens) |
-| `off_topic` | Todo lo demás | Cero (respuesta hardcodeada) |
-| `memory` | "¿Qué hablamos antes?" | Bajo (solo lectura de DB) |
+| `comparative` | Compara dos períodos ("esta semana vs la semana pasada") | Medio (2 LLM calls) |
+| `data` | Consultas de un período, productos, precios, reportes | Alto (hasta 3 LLM calls) |
+| `interaction` | Saludos, preguntas sobre cómo usar el chatbot | Bajo (1 LLM call) |
+| `feedback` | El usuario evalúa la respuesta anterior | Bajo (1 LLM call) |
+| `off_topic` | Sin relación con ventas o el negocio | Cero (respuesta fija) |
 
-El fallback por keywords evalúa `comparative` primero (palabras clave: `vs`, `versus`, `comparar`, `compará`, `diferencia entre`, `contra`) antes de caer a `data`.
+Regla de prioridad: mensajes mixtos (negocio + off-topic) se clasifican siempre por la parte del negocio. `off_topic` es el último recurso.
 
----
-
-### `app/agents/comparative_agent.py` — El comparador
-
-Maneja consultas que involucran **dos períodos** ("ayer vs antes de ayer", "enero vs febrero"). Pipeline:
-
-```
-Pregunta comparativa
-      │
-      ▼
-_extract_two_periods() — LLM extrae ambos períodos con labels y filtros SQL
-      │
-      ▼
-SP en Fabric — UN solo call con el rango completo (min_from → max_to)
-      │
-      ▼
-_load_into_memory() — carga en SQLite (reutiliza DataAgent)
-      │
-      ▼
-_compute_summary(date_filter_a) → summary_a   ┐ reutiliza DataAgent
-_compute_summary(date_filter_b) → summary_b   ┘
-      │
-      ▼
-_format_comparative_response() — LLM presenta tabla de deltas + conclusión
-```
-
-**Reutilización:** Llama directamente a `data_agent._load_into_memory()` y `data_agent._compute_summary()` — no duplica esa lógica. Solo agrega la extracción de dos períodos y el formato comparativo.
-
-**Costo:** 2 LLM calls (extracción de períodos + formato) y 1 llamado al SP — más eficiente que dos consultas `data` separadas.
+Fallback por keywords si el LLM no devuelve JSON válido. Default: `off_topic`.
 
 ---
 
-### `app/agents/data_agent.py` — El analista
+### `app/agents/data_agent.py` — El analista (Text-to-SQL)
 
-Es el agente más complejo. Implementa un pipeline **Text-to-SQL**:
+Pipeline de 7 pasos: extracción de fecha → SP en Fabric → SQLite en RAM → generación SQL → ejecución → cálculo Python → formato LLM.
 
-```
-Pregunta en español + contexto de sesión
-      │
-      ▼
-_extract_date_range() — Python primero, LLM fallback con contexto
-      │
-      ▼
-SP en Fabric (filtrado por fecha del header, sin canceladas)
-      │
-      ▼
-_generate_sql() — LLM genera SQL SQLite con business_rules + contexto
-      │
-      ▼
-SQL ejecutado contra tabla en RAM
-      │
-      ▼
-_compute_summary() — métricas calculadas en Python, filtradas por período
-      │
-      ▼
-_format_response() — LLM presenta los datos pre-calculados en lenguaje natural
-```
-
-**Punto crítico — contexto de conversación:** El parámetro `context` (resumen de sesión) se pasa tanto a `_extract_date_range` como a `_generate_sql`. Esto permite que preguntas de seguimiento como "haz un desglose por items" (sin fecha) hereden el período de la pregunta anterior.
-
-**Punto crítico — DATETIMEOFFSET:** `pyodbc` retorna las fechas del Fabric Warehouse como 20 bytes raw. Hay que decodificarlos con:
+**Punto crítico — DATETIMEOFFSET:** pyodbc entrega fechas de Fabric como 20 bytes raw. Se decodifican con:
 ```python
 struct.unpack('<hHHHHHIhh', v)
 # → year, month, day, hour, minute, second, fraction_ns, tz_h, tz_m
 ```
 
-**Punto crítico — SQLite:** La tabla en memoria usa comillas en todos los nombres de columna (`"Type" TEXT`) porque `Type` es palabra reservada en SQLite.
+**Punto crítico — contexto de sesión:** El resumen de sesión se inyecta en `_extract_date_range` y `_generate_sql`. Permite preguntas de seguimiento ("haz un desglose por items") sin repetir la fecha.
 
-**Punto crítico — period_label:** El resumen pre-calculado incluye la etiqueta del período (`=== DATOS PRE-CALCULADOS — PERÍODO: 01/12/2025 ===`). Sin esto el LLM no sabe a qué fecha corresponden los números y puede decir "no tengo información de ese día".
+**Punto crítico — métricas pre-calculadas:** `_compute_summary` calcula todo en Python (sin LLM). El LLM de formato recibe los números definitivos y solo los presenta — nunca recalcula.
+
+---
+
+### `app/agents/comparative_agent.py` — El comparador
+
+Maneja consultas con dos períodos. Hace un único llamado al SP con el rango completo (min_from → max_to) y filtra en SQLite para cada período. Reutiliza `data_agent._load_into_memory()` y `data_agent._compute_summary()` directamente.
+
+**Costo:** 2 LLM calls + 1 SP call (vs. 6 LLM calls + 2 SP calls si se usaran dos data queries separadas).
 
 ---
 
 ### `app/agents/interaction.py` — El recepcionista
 
-Responde saludos y preguntas sobre el chatbot. Usa Haiku con `max_tokens=200`. Si detecta algo fuera de scope, da una respuesta corta fija sin gastar tokens adicionales (el filtro real lo hace el Orchestrator con `off_topic`).
+Haiku con `max_tokens=200`. Responde saludos y preguntas sobre el chatbot. Si el mensaje mezcla contenido de negocio con off-topic, responde solo la parte del negocio e ignora el resto.
 
 ---
 
 ### `app/agents/memory_agent.py` — La memoria
 
-- **`save_memory()`**: Al final de cada conversación, pide a Haiku que genere un resumen de 2-3 puntos y lo guarda en SQLite.
-- **`retrieve_memory()`**: Al inicio de cada request, carga el resumen de la sesión para dárselo como contexto a los agentes.
+- `save_memory()`: Haiku genera un resumen de 2-3 puntos al final de cada intercambio y lo persiste en SQLite.
+- `retrieve_memory()`: al inicio de cada request, carga el resumen como contexto para los agentes.
 
-> El resumen es diferente al historial completo. El historial mensaje-a-mensaje se guarda en `chat_messages` via `memory_repo.save_message()`.
+El resumen (compacto, pocos tokens) es distinto al historial completo mensaje-a-mensaje guardado en `chat_messages`.
 
 ---
 
-### `app/db/connection.py` — La conexión a Fabric
+### `app/agents/training_agent.py` — El entrenador
 
-Soporta tres modos de autenticación configurables via `.env`:
+Analiza ciclos de feedback: `(user_message, bot_response, feedback, feedback_type)`. Usa Haiku para identificar la causa raíz y generar una sugerencia estructurada. Escribe en `context/training_log.md` via `TrainingMemory.add_suggestion()`.
 
-| Modo (`DB_AUTH_MODE`) | Cuándo usar |
+Formato de salida del LLM:
+```json
+{
+  "component": "data_agent | orchestrator | interaction | business_rules",
+  "root_cause": "causa raíz en una oración",
+  "suggestion": "sugerencia concreta en 1-2 oraciones",
+  "priority": "alta | media | baja"
+}
+```
+
+---
+
+### `app/db/training_repo.py` — TrainingMemory
+
+Singleton que gestiona el ciclo de vida del contexto de entrenamiento:
+
+- **Al iniciar la app**: lee `training_log.md`, parsea las últimas 20 entradas y las carga en RAM.
+- **En cada feedback**: agrega la nueva sugerencia a RAM (rotando si supera 20) y hace append en disco.
+- **En cada request con `training_mode=True`**: `get_context()` devuelve un string con las sugerencias de prioridad alta y media (limitado a ~2000 chars), que se inyecta al comienzo del contexto de los agentes.
+
+---
+
+### `app/db/connection.py` — Conexión a Fabric
+
+Tres modos via `DB_AUTH_MODE`:
+
+| Valor | Comportamiento |
 |---|---|
-| `sql` | Usuario y contraseña SQL directos |
-| `activedirectoryinteractive` | Login Azure AD con popup MFA en el browser |
-| `activedirectoryintegrated` | Azure AD integrado (Windows Auth, sin popup) |
+| `interactive` | Abre el browser para login Azure AD con MFA |
+| `activedirectoryinteractive` | Alias de `interactive` |
+| `activedirectoryintegrated` | Windows Auth integrado (sin popup) |
+| `sql` | Usuario + contraseña directos |
 
-El token Azure AD se reutiliza (singleton `_credential`) para no pedir MFA en cada request.
-
-La línea `conn.add_output_converter(-155, lambda x: x)` le dice a pyodbc que **no convierta** el tipo DATETIMEOFFSET (-155) y lo entregue como bytes raw, lo que permite decodificarlo con `struct.unpack` en el DataAgent.
-
----
-
-### `app/db/memory_repo.py` — Persistencia local
-
-SQLite local (`memory.db`) con dos tablas:
-
-**`chatbot_memory`** — Un registro por sesión con el resumen:
-```
-session_id | user_id | context | summary | created_at | updated_at
-```
-
-**`chat_messages`** — Historial completo, un registro por mensaje:
-```
-id | session_id | role | content | agent_type | created_at
-```
-
-**`query_logs`** — Un registro por consulta con el consumo real de tokens:
-```
-id | session_id | user_message | agent_type | input_tokens | output_tokens | total_tokens | created_at
-```
-
-Los tokens se acumulan de todas las llamadas LLM del request (orchestrator + agente):
-
-| Tipo de request | LLM calls trackeadas |
-|---|---|
-| `data` | hasta 3: `_extract_date_range` (solo si usa LLM fallback) + `_generate_sql` + `_format_response` |
-| `interaction` | 1: respuesta del interaction agent |
-| `off_topic` | 0: respuesta hardcodeada |
-| `memory` | 0: solo lectura de DB |
-
-Consultable via `GET /debug/token-logs?session_id=xxx`. Sin `session_id` devuelve el historial completo con totales acumulados.
+El token Azure AD se reutiliza (singleton `_credential`) entre requests para no pedir MFA en cada llamada. `conn.add_output_converter(-155, lambda x: x)` desactiva la conversión automática de DATETIMEOFFSET para recibirlo como bytes raw.
 
 ---
 
-### `context/business_rules.md` — Las reglas del negocio
+### `app/config.py` — Configuración
 
-Archivo Markdown leído en **runtime** por el DataAgent en cada consulta. No requiere reiniciar el servidor para actualizarse.
-
-Reglas clave que contiene:
-- `Type=1` → ítem unitario (incluir en sumas), `Type=2` → cabecera de promo (excluir)
-- Siempre `WHERE "Type" = '1'` en agregaciones
-- Búsqueda de artículos: `LOWER(ArticleDescription) LIKE LOWER('%texto%')`
-- Nunca mostrar nombres técnicos de columnas al usuario
-- Cómo presentar franjas horarias de manera legible
+Incluye `franchise_code` como campo fijo (leído de `.env`, default al código de la franquicia de prueba). En esta versión EXE no hay `franchise_id` dinámico ni en la API ni en la UI.
 
 ---
 
-### `app/logger.py` — Logger por sesión
+### `context/business_rules.md` — Reglas del negocio
 
-Crea un archivo de log por sesión en `logs/<session_id>.log`. Reutiliza el logger si ya tiene handlers para evitar duplicar líneas. Con `propagate = False` no duplica al logger raíz.
+Leído en runtime por DataAgent y ComparativeAgent en cada consulta. No requiere reiniciar el servidor para actualizarse.
 
----
-
-### `app/routers/debug.py` — Endpoints de debug
-
-Tres endpoints para inspeccionar el sistema sin pasar por el chat:
-
-- `POST /debug/query/csv` — Ejecuta SQL contra los datos del SP, devuelve CSV con BOM UTF-8 (compatible con Excel en Windows)
-- `POST /debug/query/json` — Mismo SQL pero devuelve `{total_rows, columns, rows}`
-- `GET /debug/token-logs` — Historial de consumo de tokens por consulta. Acepta `?session_id=xxx`
-
-Body: `{franchise_id, sql, date_from?, date_to?}`
-
-> **Nota sobre comillas en JSON:** Si el SQL contiene `"Type"`, hay que escaparlo como `\"Type\"` dentro del string JSON.
+Reglas clave:
+- `Type=2` → cabecera de promoción, excluir de totales (`WHERE "Type" != '2'`)
+- Búsqueda: `LOWER(ArticleDescription) LIKE LOWER('%texto%')`
+- Columnas de canal: `CtaChannel`, `VtaOperation`, `Plataforma`, `FormaPago`
+- No mostrar nombres técnicos de columnas al usuario final
 
 ---
 
 ### `sql/sp_GetSalesForChatbot.sql` — El Stored Procedure
 
-Corre en **Microsoft Fabric Warehouse**. Puntos críticos:
+Corre en Microsoft Fabric Warehouse. Usa 5 CTEs con `CROSS APPLY OPENJSON` para extraer datos de columnas JSON. Filtra por `h.FranchiseCode` (no `h.FranchiseeCode` — son columnas distintas).
 
-```sql
--- Filtro de fecha usa el header (no el detalle) — evita perder tickets
--- donde header y detalle tienen timestamps que caen en días distintos
-WHERE h.FranchiseCode = @FranchiseCode
-  AND c.SaleDocId IS NULL   -- excluye tickets cancelados
-  AND (
-    ...SWITCHOFFSET(TRY_CONVERT(DATETIMEOFFSET, h.DateTimeUtc), '-03:00')...
-  )
-```
-
-El SP usa **5 CTEs** que traducen columnas JSON de `sc_Silver_Cosmos_Sales_Sales` a T-SQL con `CROSS APPLY OPENJSON` (equivalente al `LATERAL VIEW explode` de Spark):
-
-| CTE | Columna JSON | Resultado | Notas |
-|---|---|---|---|
-| `Cancelled` | `StateHistory` | Tickets cancelados a excluir | `Code = 'Cancelled'` |
-| `TypeSale` | `TypeSale` | `TypeSaleId` por ticket | 1 entrada por ticket (validado) |
-| `RelatedPlatforms` | `RelatedPlatforms` | `RelatedPlatformCode` (INT) | Base para Platform y CG |
-| `Platform` | — (deriva de RelatedPlatforms) | Plataforma delivery (códigos 4/5/6) | `MAX GROUP BY` → 1 fila por ticket |
-| `CG` | — (deriva de RelatedPlatforms) | Socios ClubGrido (código 3) | `DISTINCT` → 1 fila por ticket |
-| `Payment` | `PaymentData` | Medio de pago agregado | `COUNT/MAX GROUP BY` → 1 fila por ticket |
-
-Columnas calculadas en el SELECT con los CTEs anteriores:
-
-| Columna | Lógica |
-|---|---|
-| `CtaChannel` | Take Away si PediGrido (code 5), sino según TypeSaleId 100/101/102, sino 'Tienda *' |
-| `VtaOperation` | 'Socios' si existe en CG, sino 'No Socios' |
-| `Plataforma` | 'PediGrido' / 'PedidosYa' / 'Rappi' según Platform.RelatedPlatformCode, NULL si venta directa |
-| `FormaPago` | Nombre del medio de pago, o 'Múltiples medios de pago' si cantidad > 1 |
-
-> **Atención:** `FranchiseCode` y `FranchiseeCode` son **dos columnas distintas** con valores diferentes. El filtro va sobre `FranchiseCode`.
+El filtro de fecha usa el header (`h.DateTimeUtc`), no el detalle, para evitar perder tickets donde header y detalle caen en días distintos.
 
 ---
 
-## 5. Bases de datos
+## 5. Sistema de entrenamiento
+
+### Ciclo completo
+
+```
+Usuario hace consulta → Bot responde → Usuario presiona 👍 o 👎
+                                              │
+                                   POST /chat/feedback/
+                                              │
+                                   TrainingAgent.analyze_feedback()
+                                              │
+                              ┌───────────────┴──────────────────┐
+                              │                                   │
+                    context/training_log.md              TrainingMemory (RAM)
+                    (append en disco)                    (hasta 20 entradas)
+                              │                                   │
+                    Revisión humana semanal          Inyección en prompts
+                    → aplicar en código              cuando training_mode=True
+```
+
+### Formato de cada entrada en `training_log.md`
+
+```markdown
+## [YYYY-MM-DD HH:MM] Sesión: {session_id} | Tipo: {positivo|negativo}
+
+**Chat analizado:**
+- Usuario preguntó: "..."
+- Agente respondió: "..."
+- Feedback recibido: "..."
+
+**Componente afectado:** {data_agent | orchestrator | interaction | business_rules}
+
+**Causa raíz identificada:**
+...
+
+**Sugerencia de cambio:**
+...
+
+**Prioridad:** {alta|media|baja}
+---
+```
+
+### Inyección de contexto
+
+Cuando `training_mode=True` en el request, `chat.py` antepone al contexto de memoria:
+
+```
+=== CONTEXTO DE ENTRENAMIENTO ACTIVO ===
+Sugerencias de mejora basadas en feedback previo de usuarios:
+⚠️ CORRECCIÓN (data_agent): Agregar WHERE Type != '2' al calcular promedios
+✅ PATRÓN EXITOSO (business_rules): Formato de hora como "entre las X y X+1 hs"
+```
+
+Solo se incluyen entradas de prioridad `alta` y `media`. Límite: ~2000 chars (~500 tokens).
+
+### Cómo aplicar sugerencias manualmente
+
+1. Revisar `context/training_log.md` — filtrar por `Prioridad: alta`
+2. Según `Componente afectado`:
+   - `business_rules` → editar `context/business_rules.md`
+   - `data_agent` → ajustar prompt en `_generate_sql` o `_format_response`
+   - `orchestrator` → refinar clasificaciones o agregar keywords
+   - `interaction` → ajustar prompt del interaction agent
+3. Marcar la entrada como `[APLICADO]` en el log
+
+---
+
+## 6. Bases de datos
 
 | Base de datos | Tecnología | Dónde vive | Para qué |
 |---|---|---|---|
 | Warehouse | Microsoft Fabric | Cloud | Datos de ventas (fuente de verdad) |
-| SQLite en memoria | sqlite3 | RAM del servidor | Tabla temporal por consulta (se destruye al terminar) |
-| SQLite local | sqlite3 | `memory.db` en disco | Sesiones, historial de mensajes |
+| SQLite en memoria | sqlite3 | RAM del servidor | Tabla temporal por consulta |
+| SQLite local | sqlite3 | `memory.db` | Sesiones, historial, token logs |
+| training_log.md | Markdown | `context/` | Log append-only de sugerencias |
 
----
+### Tablas en `memory.db`
 
-## 6. Cómo construirlo desde cero
-
-### Paso 1 — Prerrequisitos
-
-```bash
-# Python 3.11+
-python -m venv venv
-venv\Scripts\activate  # Windows
-
-pip install fastapi uvicorn anthropic pydantic-settings pyodbc azure-identity python-dotenv
+**`chatbot_memory`** — un registro por sesión:
+```
+session_id | user_id | context | summary | created_at | updated_at
 ```
 
-Instalar **ODBC Driver 17 for SQL Server** desde Microsoft.
-
----
-
-### Paso 2 — Variables de entorno
-
-Crear `.env` (ver `.env.example`):
-
-```env
-ANTHROPIC_API_KEY=sk-ant-...
-DB_SERVER=tu-server.database.fabric.microsoft.com
-DB_DATABASE=nombre_de_tu_warehouse
-DB_USER=tu@email.com
-DB_AUTH_MODE=activedirectoryinteractive
-MEMORY_DB_PATH=./memory.db
+**`chat_messages`** — historial completo:
+```
+id | session_id | role | content | agent_type | created_at
 ```
 
----
-
-### Paso 3 — Estructura mínima viable
-
-Para empezar con lo mínimo necesario, crear en orden:
-
+**`query_logs`** — consumo de tokens por consulta:
 ```
-1. app/config.py          → Leer variables de entorno con pydantic-settings
-2. app/db/connection.py   → Conexión pyodbc a Fabric
-3. app/db/memory_repo.py  → SQLite local + init_memory_db()
-4. app/models/schemas.py  → ChatRequest, ChatResponse (Pydantic)
-5. app/agents/orchestrator.py → Clasificar mensajes con LLM
-6. app/agents/data_agent.py   → Pipeline text-to-SQL
-7. app/agents/interaction.py  → Respuestas de conversación
-8. app/agents/memory_agent.py → Resúmenes de sesión
-9. app/routers/chat.py    → Endpoint POST /chat
-10. app/main.py           → FastAPI app + CORS + montar router
+id | session_id | user_message | agent_type | input_tokens | output_tokens | total_tokens | created_at
 ```
-
----
-
-### Paso 4 — El Stored Procedure en Fabric
-
-Ejecutar `sql/sp_GetSalesForChatbot.sql` en el Fabric Warehouse. Siempre usar `DROP PROCEDURE IF EXISTS` antes de `CREATE` porque Fabric no soporta `ALTER PROCEDURE`.
-
-```sql
-DROP PROCEDURE IF EXISTS [dbo].[sp_GetSalesForChatbot]
-GO
-CREATE PROCEDURE [dbo].[sp_GetSalesForChatbot] ...
-```
-
----
-
-### Paso 5 — Reglas de negocio
-
-Crear `context/business_rules.md` con las reglas que el LLM necesita conocer para generar SQL correcto y presentar datos apropiadamente. El DataAgent lo lee en cada consulta — no hace falta reiniciar el servidor para agregar nuevas reglas.
-
----
-
-### Paso 6 — UI de prueba
-
-`ui_test/index.html` es un archivo HTML estático servido por FastAPI (`/ui/index.html`). Solo necesita:
-- `localStorage` para persistir el `session_id` entre recargas
-- `fetch` para llamar a `POST /chat`
-- Endpoints de sesiones: `GET /chat/sessions/`, `GET /chat/sessions/{id}/messages`, `DELETE /chat/sessions/{id}`
-
----
-
-### Paso 7 — Levantar el servidor
-
-```bash
-uvicorn app.main:app --reload --port 8000
-```
-
-Abrir: `http://localhost:8000/ui/index.html`
 
 ---
 
@@ -448,62 +344,48 @@ Abrir: `http://localhost:8000/ui/index.html`
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Sí | API key de Anthropic |
 | `DB_SERVER` | Sí | Host del Fabric Warehouse |
-| `DB_DATABASE` | Sí | Nombre de la base de datos en Fabric |
-| `DB_USER` | Sí | Usuario o email Azure AD |
+| `DB_NAME` | Sí | Nombre de la base de datos |
+| `DB_USER` | Sí | Email Azure AD |
 | `DB_PASSWORD` | Solo si `DB_AUTH_MODE=sql` | Contraseña SQL |
-| `DB_AUTH_MODE` | No (default: `sql`) | `sql` / `activedirectoryinteractive` / `activedirectoryintegrated` |
+| `DB_AUTH_MODE` | No (default: `sql`) | `interactive` / `activedirectoryintegrated` / `sql` |
+| `FRANCHISE_CODE` | No (default en config.py) | Código fijo de franquicia |
 | `MEMORY_DB_PATH` | No (default: `./memory.db`) | Ruta del SQLite local |
 
 ---
 
-## 8. Decisiones de diseño importantes
+## 8. Decisiones de diseño
+
+### ¿Por qué franchise code fijo en esta versión?
+
+Agent-EXE es una versión de prueba para dos franquiciados específicos. El `franchise_id` dinámico se eliminó de la API y la UI para simplificar la distribución: el franquiciado no necesita saber su código, solo abrir la app.
 
 ### ¿Por qué SQLite en memoria para el análisis?
 
-En lugar de pedirle al LLM que genere SQL para Fabric directamente, se traen todos los datos del año al Python y se cargan en SQLite. Esto permite:
-- Queries complejos sin depender de la sintaxis T-SQL de Fabric
-- El LLM trabaja con SQLite (más simple y predecible)
-- Aislamiento: el LLM no puede modificar datos reales
+En lugar de generar T-SQL para Fabric directamente, se traen los datos al servidor Python y se cargan en SQLite. Ventajas: SQLite es más simple para el LLM (menos dialecto), el LLM no puede modificar datos reales, y permite métricas calculadas en Python con lógica determinística.
 
-**Contrapartida:** Si la franquicia tiene millones de filas, esto es inviable. Para ese caso habría que cambiar a generación de T-SQL directa contra Fabric.
+Contrapartida: inviable si la franquicia tiene millones de filas. Para ese escenario habría que pasar a T-SQL directo contra Fabric.
 
 ### ¿Por qué leer `business_rules.md` en runtime?
 
-Para poder agregar o corregir reglas sin reiniciar el servidor ni hacer un deploy. El archivo es editable directamente y el cambio toma efecto en la siguiente consulta.
+Para agregar o corregir reglas sin reiniciar el servidor. El archivo es editable directamente y el cambio toma efecto en la siguiente consulta. Fundamental para el ciclo de entrenamiento: aplicar sugerencias del `training_log.md` sin deploy.
+
+### ¿Por qué el training_agent no modifica archivos automáticamente?
+
+Las sugerencias son generadas por un LLM y pueden ser incorrectas. Un ciclo de revisión humana garantiza que solo se aplican cambios validados. El training_agent solo escribe en `training_log.md` — nunca toca código ni `business_rules.md`.
 
 ### ¿Por qué dos tablas de memoria (resumen + historial)?
 
-- `chatbot_memory` (resumen): se inyecta como contexto en cada request para que el agente "recuerde" conversaciones anteriores de forma compacta (pocos tokens).
-- `chat_messages` (historial completo): permite reconstruir la conversación exacta en la UI cuando el usuario carga una sesión anterior.
+`chatbot_memory` (resumen): inyectado como contexto en cada request — compacto, pocos tokens.
+`chat_messages` (historial completo): permite reconstruir la conversación en la UI cuando el usuario carga una sesión anterior.
 
-### ¿Por qué el tipo `off_topic` en el Orchestrator?
+### ¿Por qué el ComparativeAgent reutiliza métodos del DataAgent?
 
-Para que mensajes fuera de scope (código, clima, traducciones) no consuman tokens de generación. El router responde con texto hardcodeado sin llamar a ningún modelo.
+`_load_into_memory` y `_compute_summary` son lógica de datos pura. Cualquier mejora futura al cálculo de métricas beneficia a ambos agentes automáticamente. Un solo SP call cubre el rango completo de ambos períodos — la mitad de round-trips a Fabric vs. dos queries separadas.
 
-### ¿Por qué el filtro de fecha usa `h.DateTimeUtc` y no `d.SaleDateTimeUtc`?
+### ¿Por qué el filtro de fecha usa `h.DateTimeUtc` y no `d.SaleDateTimeUtc` en el SP?
 
-El SP original filtraba por la fecha del detalle (`d.SaleDateTimeUtc`). Spark filtra por el header (`h.DateTimeUtc`). Como header y detalle pueden tener timestamps que caen en días distintos, el SP perdía ~20 tickets por día. El fix fue mover el filtro al header, igual que Spark.
+Header y detalle pueden tener timestamps que caen en días distintos. El filtro por detalle perdía ~20 tickets por día. El filtro por header replica el comportamiento de Spark y coincide con los reportes de negocio.
 
-### ¿Por qué se excluyen los tickets cancelados?
+### ¿Por qué se excluyen tickets cancelados en el SP?
 
-Spark excluye canceladas via `Cloud_StateHistory WHERE Code = 'Cancelled'`. El SP ahora replica esto con un `CROSS APPLY OPENJSON(StateHistory)` sobre la columna JSON del header. Sin este filtro el conteo de ventas no coincide con los reportes de negocio.
-
-### ¿Por qué se pasa el contexto de sesión al Data Agent?
-
-Sin contexto, cada mensaje se procesa de forma aislada. Si el usuario pregunta "ventas del 01/12" y luego "haz un desglose por items", la segunda pregunta no tiene fecha → el agente trae el año completo → el SQL falla o es incorrecto. Pasando el resumen de sesión como contexto a `_extract_date_range` y `_generate_sql`, el LLM puede inferir el período correcto de la conversación previa.
-
-### ¿Por qué el ComparativeAgent reutiliza métodos del DataAgent en lugar de tener los suyos?
-
-`_load_into_memory` y `_compute_summary` son lógica de datos pura (no de dominio del agente). Duplicarlos significaría mantener dos implementaciones que deben mantenerse en sincronía. Al llamar directamente `data_agent._load_into_memory()` y `data_agent._compute_summary()`, cualquier mejora futura al cálculo de métricas beneficia a ambos agentes automáticamente.
-
-### ¿Por qué el ComparativeAgent hace un solo llamado al SP y no dos?
-
-Un llamado al SP por período implicaría dos round-trips a Fabric Warehouse, que es la operación más lenta del pipeline (~1-3 segundos cada una). Al traer el rango completo en un solo call y filtrar en SQLite, se reduce la latencia total a la mitad manteniendo los resultados idénticos.
-
-### ¿Por qué se agregan CtaChannel, VtaOperation, Plataforma y FormaPago al SP?
-
-Estos campos permiten al chatbot responder preguntas de negocio como "¿cuántas ventas fueron delivery?" o "¿qué porcentaje pagó con efectivo?". Se calculan en el SP (no en Python) porque requieren datos JSON de `sc_Silver_Cosmos_Sales_Sales` que no están en la vista de detalles.
-
-Los 4 campos se traen con `LEFT JOIN` para no reducir el conteo de tickets: si un ticket no tiene TypeSale o PaymentData en el JSON, devuelve NULL en esos campos en lugar de desaparecer de los resultados.
-
-`RelatedPlatformCode` está almacenado como **integer** en el JSON (sin comillas). El `OPENJSON WITH` lo declara como `INT` y las comparaciones en los CTEs usan enteros directamente (`IN (4,5,6)`, `= 3`).
+Spark excluye canceladas via `Cloud_StateHistory WHERE Code = 'Cancelled'`. El SP replica esto con `CROSS APPLY OPENJSON(StateHistory)`. Sin este filtro el conteo no coincide con los reportes.

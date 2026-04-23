@@ -1,56 +1,44 @@
-# Chatbot Multi-Agente — Asistente de Ventas para Franquiciados
+# Asistente Smart-IA — Agent-EXE
 
-Chatbot multi-agente para análisis de ventas de franquiciados. Construido con FastAPI y Claude (Anthropic), se conecta a Microsoft Fabric Warehouse para consultar datos de ventas mediante stored procedures, los carga en SQLite en memoria y usa Text-to-SQL para responder preguntas en lenguaje natural.
+Versión empaquetable del asistente de ventas para franquiciados. Franquicia fija configurada en `.env`, sin campo `franchise_id` en la UI ni en la API. Incluye sistema de entrenamiento con feedback de usuarios.
+
+Construido con FastAPI y Claude (Anthropic). Se conecta a Microsoft Fabric Warehouse, carga los datos en SQLite en memoria y responde preguntas de ventas en lenguaje natural.
 
 ## Arquitectura
 
 ```
-Cliente (UI Web / API)
+Cliente (UI Web)
     ↓
 FastAPI Gateway
     ↓
 Orchestrator Agent (Claude Sonnet — decide qué agente responde)
-    ├→ Comparative Agent (Haiku — comparativas entre dos períodos)
-    ├→ Data Agent        (Haiku — Text-to-SQL sobre datos de ventas)
-    ├→ Interaction Agent (Haiku — conversación básica del negocio)
-    ├→ off_topic         (respuesta fija sin LLM — 0 tokens)
-    └→ Memory Agent      (Haiku — resumen y contexto de sesión)
+    ├→ Comparative Agent  (Haiku — comparativas entre dos períodos)
+    ├→ Data Agent         (Haiku — Text-to-SQL sobre datos de ventas)
+    ├→ Interaction Agent  (Haiku — conversación básica del negocio)
+    ├→ Training Agent     (Haiku — analiza feedback y genera sugerencias)
+    ├→ off_topic          (respuesta fija, 0 tokens)
+    └→ Memory Agent       (Haiku — resumen y contexto de sesión)
     ↓
 Microsoft Fabric Warehouse  →  sp_GetSalesForChatbot
     ↓
-SQLite en memoria (Text-to-SQL)     SQLite local (memoria de sesiones)
+SQLite en memoria (Text-to-SQL)     SQLite local (memory.db)
 ```
 
-> Para la documentación completa de arquitectura, componentes y decisiones de diseño ver [ARCHITECTURE.md](ARCHITECTURE.md).
-
-### Flujo del Data Agent (Text-to-SQL)
-1. Extrae el rango de fechas del mensaje (Python primero, LLM como fallback) — usa el contexto de conversación previa si el mensaje no tiene fecha explícita
-2. Ejecuta `sp_GetSalesForChatbot` en Fabric Warehouse con el `FranchiseCode` y rango de fechas
-3. Carga los resultados en una tabla `ventas` SQLite en memoria
-4. El LLM genera una consulta SQLite a partir del lenguaje natural (`temperature=0`) — con contexto de conversación previa para seguimiento de preguntas
-5. Ejecuta el SQL
-6. Calcula métricas clave en Python (transacciones únicas, totales, por vendedor, top productos, horas activas) — sin LLM, filtradas por el mismo período que pidió el usuario
-7. Formatea la respuesta en español usando los datos pre-calculados
+> Documentación completa de arquitectura y decisiones de diseño: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requisitos
 
 - Python 3.12
-- Microsoft Fabric Warehouse (con ODBC Driver 18 for SQL Server)
+- ODBC Driver 18 for SQL Server
 - Cuenta Anthropic con acceso a Claude Sonnet y Haiku
-- Azure AD con permisos de lectura sobre el Warehouse
+- Azure AD con permisos de lectura sobre el Fabric Warehouse
 
 ## Instalación
 
 ```bash
-# 1. Crear entorno virtual
 python -m venv venv
-venv\Scripts\activate       # Windows
-# source venv/bin/activate  # Linux/Mac
-
-# 2. Instalar dependencias
+venv\Scripts\activate
 pip install -r requirements.txt
-
-# 3. Configurar variables de entorno
 copy .env.example .env
 # Editar .env con tus valores
 ```
@@ -58,35 +46,21 @@ copy .env.example .env
 ## Variables de entorno (`.env`)
 
 ```env
-# Anthropic API
 ANTHROPIC_API_KEY=sk-ant-...
 
-# Microsoft Fabric Warehouse
 DB_SERVER=tu-servidor.datawarehouse.fabric.microsoft.com
 DB_NAME=nombre_de_tu_warehouse
 DB_USER=tu@email.com
-DB_AUTH_MODE=interactive    # Abre el navegador para login con MFA
+DB_AUTH_MODE=interactive
 
-# Solo si DB_AUTH_MODE=sql
 DB_PASSWORD=
 
-# Memoria local (SQLite)
+FRANCHISE_CODE=4066b2def050495a8fc9ff8c0cb3f8f4
+
 MEMORY_DB_PATH=./memory.db
 ```
 
-## Configurar el Warehouse
-
-Ejecutar en el **SQL Query Editor de Microsoft Fabric**:
-
-```sql
--- 1. Stored procedure de ventas
--- (contenido en sql/sp_GetSalesForChatbot.sql)
-
--- 2. Verificar ejecución
-EXEC sp_GetSalesForChatbot @FranchiseCode = 'tu-franchise-code'
-```
-
-> La memoria de sesiones se guarda localmente en SQLite (`memory.db`). No requiere permisos DDL en Fabric.
+`DB_AUTH_MODE=interactive` abre el browser para login Azure AD con MFA. El token se cachea en `~/.azure/` y se reutiliza automáticamente.
 
 ## Ejecutar
 
@@ -94,10 +68,8 @@ EXEC sp_GetSalesForChatbot @FranchiseCode = 'tu-franchise-code'
 uvicorn app.main:app --reload
 ```
 
-Al iniciar por primera vez con `DB_AUTH_MODE=interactive`, se abrirá el navegador para autenticarse con Azure AD (MFA). El token se cachea en `~/.azure/`.
-
 Accesos:
-- **UI Web**: http://localhost:8000/ui/index.html
+- **UI**: http://localhost:8000/ui/index.html
 - **API Docs**: http://localhost:8000/docs
 - **Health**: http://localhost:8000/health
 
@@ -108,8 +80,8 @@ Accesos:
 {
   "message": "¿Cuál fue el producto más vendido ayer?",
   "session_id": "session_abc123",
-  "franchise_id": "4066b2def050495a8fc9ff8c0cb3f8f4",
-  "user_id": "opcional"
+  "user_id": "opcional",
+  "training_mode": false
 }
 ```
 Respuesta:
@@ -118,12 +90,28 @@ Respuesta:
   "session_id": "session_abc123",
   "response": "El producto más vendido ayer fue...",
   "agent_type": "data",
-  "timestamp": "2026-04-08T11:00:00"
+  "timestamp": "2026-04-23T11:00:00"
 }
 ```
 
+### `POST /chat/feedback/`
+Registra feedback explícito (botones 👍👎 de la UI) para el sistema de entrenamiento.
+```json
+{
+  "session_id": "session_abc123",
+  "user_message": "¿Cuánto vendimos ayer?",
+  "bot_response": "Ayer las ventas fueron...",
+  "feedback": "Los números no coinciden con mi cierre de caja.",
+  "feedback_type": "negativo"
+}
+```
+Respuesta:
+```json
+{ "ok": true, "component": "data_agent", "priority": "alta" }
+```
+
 ### `GET /chat/sessions/`
-Lista todas las sesiones guardadas con su resumen.
+Lista todas las sesiones con su resumen.
 
 ### `GET /chat/sessions/{session_id}/messages`
 Historial completo de mensajes de una sesión.
@@ -131,151 +119,124 @@ Historial completo de mensajes de una sesión.
 ### `DELETE /chat/sessions/{session_id}`
 Elimina una sesión y todos sus mensajes.
 
-### `GET /chat/history/{session_id}`
-Resumen de contexto de una sesión.
-
-### `POST /debug/query/csv`
-Ejecuta un SQL crudo contra los datos del SP y devuelve un CSV descargable (UTF-8 con BOM para Excel). Útil para validar las consultas generadas por el agente.
+### `POST /debug/query/csv` y `POST /debug/query/json`
+Ejecutan SQL crudo contra los datos del SP. Útil para validar queries del agente.
 ```json
 {
-  "franchise_id": "4066b2def050495a8fc9ff8c0cb3f8f4",
   "sql": "SELECT * FROM ventas WHERE \"Type\" != '2' LIMIT 100",
   "date_from": "2026-03-25",
   "date_to": "2026-03-25"
 }
 ```
 
-### `POST /debug/query/json`
-Igual que `/debug/query/csv` pero devuelve JSON con `{total_rows, columns, rows}`.
-
 ### `GET /debug/token-logs`
-Log de consumo de tokens por consulta. Acepta `?session_id=xxx` para filtrar por sesión. Sin parámetro devuelve el historial completo de todas las sesiones.
-```json
-{
-  "total_queries": 12,
-  "total_input_tokens": 18400,
-  "total_output_tokens": 3200,
-  "total_tokens": 21600,
-  "rows": [...]
-}
-```
+Consumo de tokens por consulta. Acepta `?session_id=xxx`.
 
 ## Estructura del proyecto
 
 ```
-Agent/
+Agent-EXE/
 ├── app/
 │   ├── agents/
-│   │   ├── orchestrator.py      # Decide qué agente responde
-│   │   ├── comparative_agent.py # Comparativas entre dos períodos
-│   │   ├── data_agent.py        # Text-to-SQL sobre ventas
-│   │   ├── interaction.py       # Conversación general
-│   │   └── memory_agent.py      # Resumen y contexto
+│   │   ├── orchestrator.py       # Clasifica mensajes (comparative/data/interaction/feedback/off_topic)
+│   │   ├── comparative_agent.py  # Comparativas entre dos períodos
+│   │   ├── data_agent.py         # Text-to-SQL sobre ventas
+│   │   ├── interaction.py        # Conversación general del negocio
+│   │   ├── memory_agent.py       # Resumen y contexto de sesión
+│   │   └── training_agent.py     # Analiza feedback y escribe en training_log.md
 │   ├── db/
-│   │   ├── connection.py        # Conexión Azure AD a Fabric
-│   │   ├── sales_repo.py        # Llama al SP de ventas
-│   │   └── memory_repo.py       # SQLite local (sesiones + mensajes)
+│   │   ├── connection.py         # Conexión Azure AD a Fabric (pyodbc)
+│   │   ├── sales_repo.py         # Ejecuta sp_GetSalesForChatbot
+│   │   ├── memory_repo.py        # SQLite local (sesiones + mensajes + token logs)
+│   │   └── training_repo.py      # TrainingMemory singleton (RAM + training_log.md)
 │   ├── models/
-│   │   └── schemas.py           # Modelos Pydantic
+│   │   └── schemas.py            # Pydantic: ChatRequest, FeedbackRequest, ChatResponse...
 │   ├── routers/
-│   │   ├── chat.py              # Endpoints de chat y sesiones
-│   │   └── debug.py             # Endpoints de debug (query/csv, query/json)
-│   ├── logger.py                # Logger por sesión (logs/<session_id>.log)
-│   ├── config.py                # Variables de entorno
-│   └── main.py                  # App FastAPI
+│   │   ├── chat.py               # Endpoints de chat, feedback y sesiones
+│   │   └── debug.py              # Endpoints de debug (query/csv, query/json, token-logs)
+│   ├── logger.py                 # Logger por sesión → logs/<session_id>.log
+│   ├── config.py                 # Variables de entorno (franchise_code fijo)
+│   └── main.py                   # App FastAPI + CORS + rutas
 ├── context/
-│   └── business_rules.md        # Reglas de negocio (leídas en runtime)
-├── logs/                        # Logs por sesión (auto-generado, en .gitignore)
+│   ├── business_rules.md         # Reglas de negocio (leídas en runtime)
+│   └── training_log.md           # Log append-only de sugerencias de entrenamiento
 ├── sql/
 │   └── sp_GetSalesForChatbot.sql
 ├── ui_test/
-│   └── index.html               # UI web de prueba
-├── validate_setup.py            # Valida conexión y configuración
-├── ARCHITECTURE.md              # Documentación completa de arquitectura
+│   ├── index.html                # UI principal (Tailwind CSS)
+│   └── Nacho.svg                 # Logo
+├── logs/                         # Logs por sesión (auto-generado, en .gitignore)
+├── memory.db                     # SQLite local (auto-generado)
 ├── .env.example
 ├── requirements.txt
+├── ARCHITECTURE.md
 └── README.md
 ```
-
-## Reglas de negocio (`context/business_rules.md`)
-
-El agente lee este archivo en cada consulta. Contiene:
-- Descripción de columnas de la tabla `ventas`, incluyendo los campos de canal y pago:
-  - `CtaChannel` — canal de venta (Tienda, Delivery, Take Away)
-  - `VtaOperation` — tipo de operación (Socios / No Socios)
-  - `Plataforma` — plataforma delivery (PediGrido, PedidosYa, Rappi) o NULL
-  - `FormaPago` — medio de pago del ticket
-- Regla del campo `Type`: `0` = venta regular, `1` = ítem dentro de promoción, `2` = cabecera de promoción (excluir de totales con `Type != '2'`)
-- Reglas de presentación: no mostrar información técnica al usuario
-- Reglas de búsqueda: siempre usar `LOWER(...) LIKE LOWER('%texto%')` para nombres de artículos
-
-Para agregar una nueva regla de negocio, editar `context/business_rules.md` — no se requiere reiniciar el servidor.
 
 ## Agentes
 
 ### Orchestrator (Claude Sonnet)
-Clasifica cada mensaje en uno de cinco tipos:
 
 | Tipo | Descripción | Costo |
 |---|---|---|
-| `comparative` | Comparativas entre dos períodos ("esta semana vs la semana pasada") | Medio (2 LLM calls) |
-| `data` | Consultas de ventas de un solo período, productos, precios, reportes | Alto (hasta 3 LLM calls) |
-| `interaction` | Saludos, preguntas sobre el chatbot | Bajo (1 LLM call, 200 tokens) |
-| `off_topic` | Programación, clima, traducciones, etc. | Cero (respuesta fija, 0 tokens) |
-| `memory` | "¿Qué hablamos antes?" | Mínimo (solo lectura DB) |
+| `comparative` | Compara dos períodos ("esta semana vs la semana pasada") | Medio |
+| `data` | Consultas de un período, productos, precios, reportes | Alto |
+| `interaction` | Saludos, preguntas sobre el chatbot | Bajo |
+| `feedback` | El usuario comenta la respuesta anterior del bot | Bajo |
+| `off_topic` | Sin relación con ventas o el negocio | Cero |
 
-Cada consulta registra el consumo real de tokens (input + output, por agente) en la tabla `query_logs` del SQLite local. Consultable via `GET /debug/token-logs`.
+### Training Agent (Claude Haiku)
 
-Usa palabras clave como fallback si el LLM no responde en formato JSON válido. El default de fallback es `off_topic` (no `interaction`) para evitar gastar tokens en mensajes irrelevantes.
+Analiza ciclos de feedback (pregunta → respuesta → evaluación del usuario) e identifica la causa raíz del problema. Genera una entrada estructurada en `context/training_log.md`:
 
-### Comparative Agent (Claude Haiku)
-Maneja consultas que comparan dos períodos ("ayer vs antes de ayer", "enero vs febrero"). Pipeline:
-1. LLM extrae los dos períodos del mensaje (labels + rangos de fecha)
-2. Un solo llamado al SP cubriendo el rango completo de ambos períodos
-3. Carga los datos en SQLite en memoria
-4. Calcula métricas en Python para cada período por separado (reutiliza `_compute_summary` del Data Agent)
-5. LLM formatea la comparativa con tabla de deltas, desglose por vendedor, top productos y conclusión
+```markdown
+## [2026-04-23 14:30] Sesión: session_abc | Tipo: negativo
 
-Reutiliza `_load_into_memory` y `_compute_summary` del Data Agent — sin duplicar lógica.
+**Componente afectado:** data_agent
+**Causa raíz identificada:** El agente no filtra por Type != '2' al calcular promedios
+**Sugerencia de cambio:** Agregar regla explícita en business_rules.md
+**Prioridad:** alta
+```
 
-### Data Agent (Claude Haiku)
-1. Extrae el rango de fechas con detección Python primero (hoy/ayer/esta semana/semana pasada/este mes) y LLM como fallback para fechas específicas — el contexto de conversación previa se inyecta para mantener el período en preguntas de seguimiento ("haz un desglose por items" después de "ventas del 01/12")
-2. Llama al SP con el `franchise_id` y rango de fechas extraído
-3. Carga los datos en SQLite en memoria (decodificando `DATETIMEOFFSET` binario de pyodbc)
-4. Genera SQL SQLite con el LLM (`temperature=0`, usando las reglas de negocio y contexto de conversación como contexto)
-5. Ejecuta el SQL
-6. Calcula métricas de resumen en Python (sin LLM): transacciones únicas por `COUNT(DISTINCT id)`, totales, desglose por vendedor, top productos y franjas horarias — filtradas por el mismo período que el usuario pidió
-7. Formatea la respuesta usando los números pre-calculados — el LLM solo presenta, no recalcula
+Cuando `training_mode: true` en el request, el sistema inyecta las sugerencias de alta/media prioridad como contexto adicional en los prompts de los agentes activos.
 
-### Interaction Agent (Claude Haiku)
-Responde únicamente saludos y preguntas sobre el uso del chatbot (`max_tokens=200`). Si el mensaje no está relacionado con ventas o el negocio, devuelve una respuesta corta fija sin gastar tokens adicionales. El filtrado real de mensajes off-topic ocurre en el Orchestrator antes de llegar a este agente.
+## Sistema de entrenamiento
 
-### Memory Agent (Claude Haiku)
-Genera resúmenes de la conversación y los persiste en SQLite local. El contexto se recupera al inicio de cada sesión.
+El ciclo de aprendizaje es:
+
+1. Usuario hace una consulta → bot responde
+2. Usuario presiona 👍 o 👎 en la UI
+3. Para 👎: aparece un campo de texto "¿Qué falló?"
+4. El `training_agent` analiza el ciclo y escribe en `context/training_log.md`
+5. Con `Entrenamiento` activado en la UI, las sugerencias se inyectan como contexto
+
+Para aplicar manualmente las sugerencias: revisar `context/training_log.md`, filtrar por `Prioridad: alta`, aplicar los cambios en el componente indicado y marcar como `[APLICADO]`.
+
+## Reglas de negocio (`context/business_rules.md`)
+
+Leído en runtime en cada consulta. Para agregar una regla nueva no es necesario reiniciar el servidor.
+
+Reglas clave:
+- `Type=2` → cabecera de promoción (excluir de totales con `WHERE "Type" != '2'`)
+- Búsqueda de artículos: `LOWER(ArticleDescription) LIKE LOWER('%texto%')`
+- Columnas de canal: `CtaChannel`, `VtaOperation`, `Plataforma`, `FormaPago`
 
 ## Troubleshooting
 
-**Error de autenticación Azure AD (22007 / 24803)**
-- Usar `DB_AUTH_MODE=interactive` en lugar de `sql`
-- Asegurarse de tener instalado `azure-identity` (`pip install azure-identity`)
+**Error de autenticación Azure AD (24803)**
+- Verificar que `.env` tiene `DB_AUTH_MODE=interactive`
+- `pip install azure-identity`
 
-**El SP devuelve 0 filas**
-- Verificar que el WHERE usa `h.FranchiseCode` (no `h.FranchiseeCode`)
+**SP devuelve 0 filas**
+- Verificar que `FRANCHISE_CODE` en `.env` corresponde a `FranchiseCode` (no `FranchiseeCode`) en Fabric
 - Ejecutar `EXEC sp_GetSalesForChatbot @FranchiseCode = 'tu-id'` directo en Fabric
 
-**Fechas incorrectas**
-- La columna `SaleDateTimeUtc` en Fabric es `DATETIMEOFFSET` en UTC+00:00
-- El SP aplica `SWITCHOFFSET(..., '-03:00')` para convertir a Argentina
-- pyodbc devuelve el valor como bytes binarios de 20 bytes — el agente los decodifica con `struct.unpack`
-
-**No aparece información de ventas**
-- Validar setup: `python validate_setup.py`
-- Verificar que `franchise_id` en el UI corresponde a `FranchiseCode` en Fabric (no `FranchiseeCode`)
-
 **Error de ODBC Driver**
-- Verificar que el ODBC Driver 18 for SQL Server está instalado: `Get-OdbcDriver | Select-Object Name` en PowerShell
-- Descargar desde: https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server
+```powershell
+Get-OdbcDriver | Select-Object Name
+```
+Descargar ODBC Driver 18 desde Microsoft si no aparece en la lista.
 
-**Resultados inconsistentes entre consultas idénticas**
-- Asegurarse de que los tres llamados LLM del Data Agent usan `temperature=0`
-- Los conteos de transacciones se calculan con `COUNT(DISTINCT id)` en Python, no por el LLM
+**Resultados inconsistentes**
+- Los conteos se calculan con `COUNT(DISTINCT id)` en Python, no por el LLM
+- Verificar que `temperature=0` en todos los agentes
