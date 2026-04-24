@@ -22,6 +22,9 @@ def _load_business_rules() -> str:
         return ""
 
 
+_BUSINESS_RULES = _load_business_rules()
+
+
 class DataAgent:
     def __init__(self):
         self.client = Anthropic(api_key=settings.anthropic_api_key, max_retries=3)
@@ -72,7 +75,7 @@ class DataAgent:
 
     def _generate_sql(self, user_message: str, total_rows: int, today: str, context: str = "") -> tuple[str, int, int]:
         """LLM genera el SQL apropiado para la pregunta del usuario."""
-        business_rules = _load_business_rules()
+        business_rules = _BUSINESS_RULES
         context_block = f"\nCONTEXTO DE CONVERSACIÓN PREVIA:\n{context}\n" if context else ""
         response = self.client.messages.create(
             model=self.model,
@@ -85,6 +88,7 @@ Fecha de hoy: {today}
 {context_block}
 Reglas IMPORTANTES de SQL (SQLite):
 - Responde SOLO con la consulta SQL, sin explicaciones ni markdown ni bloques de código
+- Si el mensaje del usuario es muy corto o es una continuación ("en facturación", "por monto", "y en $", "también", etc.), usa el CONTEXTO DE CONVERSACIÓN PREVIA para reconstruir la pregunta completa (misma agrupación, misma fecha, pero con la métrica/dimensión que indica el mensaje).
 - La base de datos es SQLite — usa SOLO funciones SQLite:
   * Para año: strftime('%Y', SaleDateTimeUtc)
   * Para mes: strftime('%m', SaleDateTimeUtc)
@@ -154,6 +158,8 @@ Reglas IMPORTANTES de SQL (SQLite):
             def fmt(n):
                 return f"${n:,.0f}".replace(",", ".")
 
+            avg_ticket = round(totals[1] / totals[0]) if totals[0] else 0
+
             period_str = f" — PERÍODO: {period_label}" if period_label else ""
             lines = [
                 f"=== DATOS PRE-CALCULADOS{period_str} (usar exactamente estos números) ===",
@@ -161,12 +167,14 @@ Reglas IMPORTANTES de SQL (SQLite):
                 f"RESUMEN GENERAL:",
                 f"- Transacciones: {totals[0]}",
                 f"- Total ventas: {fmt(totals[1])}",
+                f"- Ticket promedio: {fmt(avg_ticket)}",
                 f"- Vendedores activos: {totals[2]}",
                 "",
                 "POR VENDEDOR:",
             ]
             for v in by_vendor:
-                lines.append(f"  • {v[0]}: {v[1]} transacciones | {fmt(v[2])}")
+                v_ticket = round(v[2] / v[1]) if v[1] else 0
+                lines.append(f"  • {v[0]}: {v[1]} transacciones | {fmt(v[2])} | ticket prom: {fmt(v_ticket)}")
 
             lines += ["", "TOP PRODUCTOS (por unidades):"]
             for p in top_products:
@@ -182,7 +190,7 @@ Reglas IMPORTANTES de SQL (SQLite):
 
     def _format_response(self, user_message: str, sql: str, columns: list, rows: list, summary: str) -> tuple[str, int, int]:
         """LLM formatea los resultados en lenguaje natural."""
-        business_rules = _load_business_rules()
+        business_rules = _BUSINESS_RULES
 
         # Para respuestas con muchas filas, usar solo los datos pre-calculados
         if len(rows) > 20:
@@ -198,6 +206,8 @@ Reglas IMPORTANTES de SQL (SQLite):
 
 INSTRUCCIÓN CRÍTICA: Los siguientes datos fueron calculados con precisión en Python. Úsalos EXACTAMENTE como aparecen. NO recalcules ni modifiques ningún número.
 
+INSTRUCCIÓN DE PERÍODO: Los datos pre-calculados indican el período exacto analizado. Úsalo siempre al describir los resultados. NUNCA uses "período completo", "datos generales" ni términos vagos si el período está definido.
+
 Si el mensaje del usuario incluye preguntas no relacionadas con ventas o el negocio, ignóralas por completo. No las menciones ni las respondas.
 
 {summary}
@@ -211,15 +221,14 @@ Reglas de presentación:
         )
         return response.content[0].text, response.usage.input_tokens, response.usage.output_tokens
 
-    def _extract_date_range(self, user_message: str, context: str = "") -> tuple[datetime | None, datetime | None, str, int, int]:
-        """Extrae el rango de fechas del mensaje. Retorna (date_from, date_to, date_filter_sql)."""
+    def _extract_date_range(self, user_message: str, context: str = "") -> tuple[datetime | None, datetime | None, str, int, int, str]:
+        """Extrae el rango de fechas del mensaje. Retorna (date_from, date_to, date_filter_sql, tok_in, tok_out, clarification)."""
         import json
         now = datetime.now()
         today = now.date()
         msg = user_message.lower()
 
         def day_range(d):
-            """Devuelve (inicio_dia, fin_dia, filtro_sql) para una fecha dada."""
             dt_from = datetime.combine(d, datetime.min.time())
             dt_to = datetime.combine(d, datetime.max.time().replace(microsecond=0))
             sql = f"DATE(SaleDateTimeUtc) = '{d.isoformat()}'"
@@ -227,16 +236,16 @@ Reglas de presentación:
 
         # Detección directa en Python — sin LLM, sin fallos (0 tokens)
         if "hoy" in msg:
-            return (*day_range(today), 0, 0)
+            return (*day_range(today), 0, 0, "")
         if "ayer" in msg:
-            return (*day_range(today - timedelta(days=1)), 0, 0)
+            return (*day_range(today - timedelta(days=1)), 0, 0, "")
         if "esta semana" in msg:
             start = today - timedelta(days=today.weekday())
             return (
                 datetime.combine(start, datetime.min.time()),
                 datetime.combine(today, datetime.max.time().replace(microsecond=0)),
                 f"DATE(SaleDateTimeUtc) >= '{start.isoformat()}'",
-                0, 0,
+                0, 0, "",
             )
         if "semana pasada" in msg:
             start = today - timedelta(days=today.weekday() + 7)
@@ -245,7 +254,7 @@ Reglas de presentación:
                 datetime.combine(start, datetime.min.time()),
                 datetime.combine(end, datetime.max.time().replace(microsecond=0)),
                 f"DATE(SaleDateTimeUtc) BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'",
-                0, 0,
+                0, 0, "",
             )
         if "este mes" in msg:
             start = today.replace(day=1)
@@ -253,18 +262,24 @@ Reglas de presentación:
                 datetime.combine(start, datetime.min.time()),
                 datetime.combine(today, datetime.max.time().replace(microsecond=0)),
                 f"strftime('%Y-%m', SaleDateTimeUtc) = '{today.strftime('%Y-%m')}'",
-                0, 0,
+                0, 0, "",
             )
 
         # LLM como fallback para fechas específicas ("25 de marzo", "del 1 al 15", etc.)
-        context_hint = f"\nContexto de conversación previa (puede contener la fecha relevante):\n{context}\n" if context else ""
+        context_hint = f"\nContexto de conversación previa:\n{context}\n" if context else ""
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=60,
+            max_tokens=80,
             temperature=0,
-            system=f"""Hoy es {today}. Extrae el rango de fechas del mensaje o del contexto previo si el mensaje no tiene fecha explícita.
-Responde SOLO con JSON: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}}
-Si no hay fecha en el mensaje ni en el contexto responde: {{"date_from": null, "date_to": null}}{context_hint}""",
+            system=f"""Hoy es {today}. Extrae el rango de fechas para responder la consulta del usuario.
+
+REGLA PRINCIPAL: Si el mensaje actual es corto o no menciona fecha, usa el período más reciente del contexto previo. NUNCA retornes null si el contexto menciona fechas o períodos.
+
+REGLA DE AMBIGÜEDAD: Si el mensaje menciona un mes o período sin año (ej: "en marzo", "de enero a febrero") y no se puede determinar con certeza si es {today.year} o {today.year - 1}, devuelve:
+{{"date_from": null, "date_to": null, "clarification": "¿A qué año te referís, {today.year - 1} o {today.year}?"}}
+
+Solo retorna null sin clarification si no hay absolutamente ninguna fecha ni en el mensaje ni en el contexto.
+En cualquier otro caso devuelve: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}}{context_hint}""",
             messages=[{"role": "user", "content": user_message}],
         )
         llm_in, llm_out = response.usage.input_tokens, response.usage.output_tokens
@@ -273,6 +288,8 @@ Si no hay fecha en el mensaje ni en el contexto responde: {{"date_from": null, "
             text = response.content[0].text.strip()
             start = text.find("{")
             data = json.loads(text[start:text.rfind("}") + 1])
+            if data.get("clarification"):
+                return None, None, "", llm_in, llm_out, data["clarification"]
             if data.get("date_from"):
                 df = datetime.strptime(data["date_from"], "%Y-%m-%d")
                 dt = datetime.strptime(data["date_to"] + " 23:59:59", "%Y-%m-%d %H:%M:%S") if data.get("date_to") else df.replace(hour=23, minute=59, second=59)
@@ -281,11 +298,11 @@ Si no hay fecha en el mensaje ni en el contexto responde: {{"date_from": null, "
                     if data["date_from"] == data.get("date_to")
                     else f"DATE(SaleDateTimeUtc) BETWEEN '{data['date_from']}' AND '{data.get('date_to', today.isoformat())}'"
                 )
-                return df, dt, date_filter, llm_in, llm_out
+                return df, dt, date_filter, llm_in, llm_out, ""
         except Exception:
             pass
 
-        return None, None, "", llm_in, llm_out
+        return None, None, "", llm_in, llm_out, ""
 
     def process_data_request(self, user_message: str, franchise_code: str, context: str = "", session_id: str = "") -> tuple[str, int, int]:
         log = get_session_logger(session_id) if session_id else logging.getLogger(__name__)
@@ -298,8 +315,14 @@ Si no hay fecha en el mensaje ni en el contexto responde: {{"date_from": null, "
         total_input = total_output = 0
 
         # 1. Extraer rango de fechas del mensaje para filtrar en el SP
-        date_from, date_to, date_filter, tok_in, tok_out = self._extract_date_range(user_message, context)
+        date_from, date_to, date_filter, tok_in, tok_out, clarification = self._extract_date_range(user_message, context)
         total_input += tok_in; total_output += tok_out
+
+        if clarification:
+            log.info(f"CLARIF   : {clarification!r}")
+            log.info("━" * 60)
+            return clarification, total_input, total_output
+
         log.info(f"FECHAS   : date_from={date_from}  date_to={date_to}")
         log.info(f"FILTRO   : {date_filter or '(sin filtro de fecha — año completo)'}")
 

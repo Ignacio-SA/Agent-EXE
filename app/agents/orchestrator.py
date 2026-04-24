@@ -18,11 +18,13 @@ class OrchestratorAgent:
         system_prompt = """Eres un orquestador de un chatbot de ventas para franquiciados. Clasifica el mensaje:
 
 1. "comparative" — consultas que comparan DOS períodos o dimensiones: "esta semana vs la semana pasada", "enero vs febrero", "compará hoy con ayer", "diferencia entre", "cómo fue X comparado con Y".
-2. "data" — consultas de ventas de UN solo período: productos, artículos, precios, turnos, POS, reportes, métricas del negocio.
+2. "data" — consultas de ventas de UN solo período: productos, artículos, precios, turnos, POS, reportes, métricas del negocio. INCLUYE consultas que referencian un período mencionado antes ("el período que te dije", "el mismo período", "anteriormente", "como antes", "del período anterior").
 3. "interaction" — saludos, preguntas sobre cómo usar el chatbot, conversación mínima relacionada con el negocio.
-4. "feedback" — el usuario evalúa o comenta la respuesta anterior del bot: "estuvo mal", "eso es incorrecto", "perfecto", "muy bien", "no era lo que pedí", "la respuesta anterior", "eso no es correcto".
+4. "feedback" — ÚNICAMENTE cuando el usuario evalúa la CALIDAD o CORRECCIÓN de la respuesta del bot: "estuvo mal", "eso es incorrecto", "perfecto", "muy bien", "no era lo que pedí", "eso no es correcto". NO es feedback si el usuario hace una nueva consulta que menciona el contexto previo.
 5. "off_topic" — SOLO cuando el mensaje NO contiene NINGUNA parte relacionada con ventas o el negocio.
 
+REGLA CRÍTICA: Frases como "el período que mencioné", "anteriormente", "lo que te pedí antes", "el mismo rango" son referencias a contexto de conversación, NO evaluaciones de calidad. Clasifica esos mensajes como "data" o "comparative" según corresponda.
+REGLA DE CLARIFICACIÓN: Si el contexto previo muestra que el bot hizo una pregunta de aclaración sobre fechas o año ("¿A qué año te referís?", "¿2025 o 2026?"), y el mensaje del usuario es una respuesta corta ("2025", "el año pasado", "ese año", "2026"), clasificar como "data" o "comparative" según el tipo de consulta original en el contexto.
 REGLA DE PRIORIDAD: Si el mensaje mezcla contenido de negocio con contenido off-topic, clasificar siempre por la parte de negocio e ignorar el resto. "off_topic" es el último recurso.
 Si hay duda entre "comparative" y "data", usar "comparative".
 Si hay duda entre "data" e "interaction", usar "data".

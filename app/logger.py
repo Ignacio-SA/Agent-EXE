@@ -2,7 +2,10 @@ import logging
 import os
 from datetime import datetime
 
-_LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+_LOGS_DIR = os.environ.get(
+    "SESSION_LOGS_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "logs"),
+)
 
 
 def _ensure_logs_dir():

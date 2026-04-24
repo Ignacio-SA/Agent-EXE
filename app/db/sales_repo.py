@@ -1,7 +1,10 @@
+import logging
 import time
 from datetime import datetime, date
 
 from .connection import db
+
+_log = logging.getLogger(__name__)
 
 
 class _SalesCache:
@@ -64,12 +67,14 @@ class SalesRepository:
 
         with db.get_connection() as conn:
             cursor = conn.cursor()
+            t0 = time.perf_counter()
             cursor.execute(
                 "EXEC sp_GetSalesForChatbot @FranchiseCode=?, @Year=?, @DateFrom=?, @DateTo=?",
                 (franchise_code, year, date_from, date_to),
             )
             columns = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
+            _log.info("[DB timing] SP execution: %.0f ms, rows=%d", (time.perf_counter() - t0) * 1000, len(rows))
             result = [dict(zip(columns, row)) for row in rows]
 
         _cache.set(franchise_code, date_from, date_to, result)

@@ -82,7 +82,7 @@ async def chat(request: ChatRequest):
             {"role": "assistant", "content": response_text},
         ]
         user_id = request.user_id or settings.franchise_code
-        memory_agent.save_memory(request.session_id, user_id, conversation)
+        memory_agent.save_memory(request.session_id, user_id, conversation, previous_summary=memory_context)
 
         return ChatResponse(
             session_id=request.session_id,

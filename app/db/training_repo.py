@@ -1,7 +1,10 @@
 import os
 import re
 
-_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "context", "training_log.md")
+_LOG_PATH = os.environ.get(
+    "TRAINING_LOG_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "..", "context", "training_log.md"),
+)
 _MAX_ENTRIES = 20
 _MAX_CONTEXT_CHARS = 2000
 

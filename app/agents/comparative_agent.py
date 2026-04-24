@@ -17,10 +17,10 @@ class ComparativeAgent:
 
     def _extract_two_periods(
         self, user_message: str, context: str = ""
-    ) -> tuple[dict, dict, int, int]:
+    ) -> tuple[dict, dict, int, int, str]:
         """
         Extrae dos períodos de la consulta comparativa.
-        Retorna (period_a, period_b, input_tokens, output_tokens)
+        Retorna (period_a, period_b, input_tokens, output_tokens, clarification)
         donde cada período es {"label": str, "date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD", "date_filter": str}
         """
         today = datetime.now().date()
@@ -28,10 +28,15 @@ class ComparativeAgent:
 
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=150,
+            max_tokens=160,
             temperature=0,
             system=f"""Hoy es {today}. Extrae los DOS períodos que el usuario quiere comparar.
-Responde SOLO con JSON:
+Si el mensaje es corto o incompleto, usa el contexto previo para inferir los períodos faltantes.
+
+REGLA DE AMBIGÜEDAD: Si el año de algún período es ambiguo (se menciona un mes sin año y no es claro si es {today.year} o {today.year - 1}), devuelve:
+{{"clarification": "¿A qué año te referís para [período], {today.year - 1} o {today.year}?"}}
+
+En cualquier otro caso devuelve SOLO este JSON:
 {{
   "period_a": {{"label": "nombre legible", "date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}},
   "period_b": {{"label": "nombre legible", "date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}}
@@ -45,6 +50,15 @@ Responde SOLO con JSON:
         try:
             text = response.content[0].text.strip()
             data = json.loads(text[text.find("{") : text.rfind("}") + 1])
+
+            if data.get("clarification"):
+                fallback = {
+                    "label": "período",
+                    "date_from": datetime.now().replace(hour=0, minute=0, second=0),
+                    "date_to": datetime.now().replace(hour=23, minute=59, second=59),
+                    "date_filter": f"DATE(SaleDateTimeUtc) = '{today}'",
+                }
+                return fallback, fallback, tok_in, tok_out, data["clarification"]
 
             def build_period(p: dict) -> dict:
                 df = p["date_from"]
@@ -61,7 +75,7 @@ Responde SOLO con JSON:
                     "date_filter": date_filter,
                 }
 
-            return build_period(data["period_a"]), build_period(data["period_b"]), tok_in, tok_out
+            return build_period(data["period_a"]), build_period(data["period_b"]), tok_in, tok_out, ""
 
         except Exception:
             fallback = {
@@ -70,7 +84,7 @@ Responde SOLO con JSON:
                 "date_to": datetime.now().replace(hour=23, minute=59, second=59),
                 "date_filter": f"DATE(SaleDateTimeUtc) = '{today}'",
             }
-            return fallback, fallback, tok_in, tok_out
+            return fallback, fallback, tok_in, tok_out, ""
 
     def _format_comparative_response(
         self,
@@ -88,6 +102,8 @@ Responde SOLO con JSON:
             system=f"""Eres un asistente de ventas. Presentá una comparación clara entre dos períodos en español, usando markdown con tablas.
 
 INSTRUCCIÓN CRÍTICA: Usá EXACTAMENTE los números de los bloques de datos pre-calculados. NO recalcules ni modifiques ningún número. Calculá deltas y variaciones porcentuales solo a partir de esos números.
+
+INSTRUCCIÓN DE PERÍODO: Los bloques indican los períodos exactos comparados. Úsalos siempre. NUNCA uses "período completo" ni términos vagos si los períodos están definidos.
 
 Si el mensaje del usuario incluye preguntas no relacionadas con ventas o el negocio, ignóralas por completo. No las menciones ni las respondas.
 
@@ -124,9 +140,15 @@ Nunca mostres nombres técnicos de columnas ni códigos internos.""",
         total_input = total_output = 0
 
         # 1. Extraer los dos períodos
-        period_a, period_b, tok_in, tok_out = self._extract_two_periods(user_message, context)
+        period_a, period_b, tok_in, tok_out, clarification = self._extract_two_periods(user_message, context)
         total_input += tok_in
         total_output += tok_out
+
+        if clarification:
+            log.info(f"CLARIF     : {clarification!r}")
+            log.info("━" * 60)
+            return clarification, total_input, total_output
+
         log.info(f"PERÍODO A  : {period_a['label']} ({period_a['date_from'].date()} → {period_a['date_to'].date()})")
         log.info(f"PERÍODO B  : {period_b['label']} ({period_b['date_from'].date()} → {period_b['date_to'].date()})")
 

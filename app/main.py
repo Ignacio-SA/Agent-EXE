@@ -31,6 +31,12 @@ if not settings.anthropic_api_key:
 if settings.db_auth_mode == "sql" and not settings.db_password:
     raise RuntimeError("DB_PASSWORD no está configurada en el archivo .env")
 
+from .db.connection import _check_odbc_driver  # noqa: E402
+try:
+    _check_odbc_driver()
+except Exception as e:
+    raise RuntimeError(str(e)) from e
+
 app = FastAPI(
     title="Chatbot Multi-Agente",
     description="API de chatbot con múltiples agentes especializados",

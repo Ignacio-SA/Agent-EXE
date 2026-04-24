@@ -19,7 +19,7 @@
 | CtaChannel         | TEXT    | Canal de venta: 'Tienda', 'Delivery', 'Take Away', 'Tienda *' (sin datos de canal) |
 | VtaOperation       | TEXT    | Tipo de operación: 'Socios' (ClubGrido) o 'No Socios' |
 | Plataforma         | TEXT    | Plataforma delivery: 'PediGrido', 'PedidosYa', 'Rappi'. NULL si es venta directa |
-| FormaPago          | TEXT    | Medio de pago del ticket. 'Múltiples medios de pago' si usó más de uno. NULL si sin datos |
+| FormaPago          | TEXT    | Medio de pago del ticket. Valores conocidos: 'Efectivo', 'Mercado Pago', 'Tarjeta de Débito', 'Tarjeta de Crédito', 'Transferencia', 'Múltiples medios de pago' (si usó más de uno). NULL si sin datos |
 
 ---
 
@@ -75,6 +75,7 @@ GROUP BY ArticleDescription
 - **Nunca** usar `YEAR()`, `MONTH()`, `DATEPART()` — no existen en SQLite.
 - El precio total de una venta es `SUM(UnitPriceFix * Quantity)` filtrando `Type != '2'`.
 - Para buscar artículos por nombre **siempre** usar `LOWER(ArticleDescription) LIKE LOWER('%texto%')` — nunca comparación exacta, el usuario puede escribir en minúsculas y el dato tener mayúsculas.
+- **Ticket promedio** = `ROUND(SUM(CAST(UnitPriceFix AS REAL) * CAST(Quantity AS REAL)) / COUNT(DISTINCT id))` filtrando `Type != '2'`. **Nunca calcular** dividiendo totales ya redondeados/formateados — introduce error de precisión. En los resúmenes pre-calculados el ticket promedio ya viene incluido; usarlo directamente sin recalcular.
 - Para franjas horarias usar `strftime('%H', SaleDateTimeUtc)` que devuelve la hora en formato '00'-'23'.
 - Para agrupar por franja horaria: `GROUP BY strftime('%H', SaleDateTimeUtc) ORDER BY COUNT(*) DESC`.
 
