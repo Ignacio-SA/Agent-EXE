@@ -1,5 +1,7 @@
 import logging
 import os
+import sys
+
 
 def _logs_dir() -> str:
     return os.environ.get(
@@ -11,7 +13,7 @@ def _logs_dir() -> str:
 def get_session_logger(session_id: str) -> logging.Logger:
     """
     Retorna un logger dedicado para la sesión.
-    Escribe en logs/<session_id>.log — un archivo por sesión.
+    Escribe en logs/<session_id>.log Y también imprime en consola en tiempo real.
     """
     logs_dir = _logs_dir()
     os.makedirs(logs_dir, exist_ok=True)
@@ -26,12 +28,20 @@ def get_session_logger(session_id: str) -> logging.Logger:
     logger.setLevel(logging.DEBUG)
     logger.propagate = False  # No duplicar en el logger raíz
 
-    log_path = os.path.join(logs_dir, f"{session_id}.log")
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setFormatter(logging.Formatter(
+    fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    logger.addHandler(handler)
+        datefmt="%H:%M:%S",
+    )
+
+    # Handler a archivo (por sesión)
+    log_path = os.path.join(logs_dir, f"{session_id}.log")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    # Handler a consola — para ver los logs en vivo en el .exe o terminal
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(fmt)
+    logger.addHandler(console_handler)
 
     return logger

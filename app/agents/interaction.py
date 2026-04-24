@@ -1,6 +1,10 @@
+import logging
+
 from anthropic import Anthropic
 
 from ..config import settings
+
+_log = logging.getLogger(__name__)
 
 
 class InteractionAgent:
@@ -10,8 +14,13 @@ class InteractionAgent:
 
     def respond(self, user_message: str, memory_context: str = "") -> tuple[str, int, int]:
         """
-        Claude Haiku responde conversacionalmente
+        Claude Haiku responde conversacionalmente.
         """
+        _log.info("[InteractionAgent] Generando respuesta conversacional…")
+        _log.info(f"[InteractionAgent] Mensaje: {user_message!r}")
+        if memory_context:
+            _log.info(f"[InteractionAgent] Contexto disponible: {memory_context[:150]!r}")
+
         system_prompt = """Eres un asistente de ventas para franquiciados. Responde preguntas sobre:
 - Saludos y conversación básica relacionada con el negocio
 - Dudas sobre cómo usar este asistente
@@ -29,7 +38,11 @@ No traduzcas ni resuelvas tareas externas."""
             messages=[{"role": "user", "content": user_message}],
         )
 
-        return response.content[0].text, response.usage.input_tokens, response.usage.output_tokens
+        tok_in  = response.usage.input_tokens
+        tok_out = response.usage.output_tokens
+        _log.info(f"[InteractionAgent] Respuesta generada — tokens: input={tok_in}  output={tok_out}")
+
+        return response.content[0].text, tok_in, tok_out
 
 
 interaction_agent = InteractionAgent()

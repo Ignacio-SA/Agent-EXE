@@ -31,7 +31,7 @@ class DataAgent:
         self.model = "claude-haiku-4-5-20251001"
 
     def _load_into_memory(self, sales: list[dict]) -> sqlite3.Connection:
-        """Carga los datos del SP en una tabla SQLite en memoria."""
+        """Carga los datos del SP/DB local en una tabla SQLite en memoria."""
         conn = sqlite3.connect(":memory:")
         if not sales:
             conn.execute("""
@@ -51,17 +51,14 @@ class DataAgent:
             if v is None:
                 return None
             # DATETIMEOFFSET llega como bytes raw del ODBC driver (20 bytes)
-            # Formato: year(h) month(H) day(H) hour(H) minute(H) second(H) fraction_ns(I) tz_h(h) tz_m(h)
             if isinstance(v, (bytes, bytearray)) and len(v) == 20:
                 year, month, day, hour, minute, second, fraction, tz_h, tz_m = struct.unpack('<hHHHHHIhh', v)
                 microsecond = fraction // 1000
                 tz = timezone(timedelta(hours=tz_h, minutes=tz_m))
                 dt = datetime(year, month, day, hour, minute, second, microsecond, tzinfo=tz)
-                # Guardar en hora local (ya viene en -03:00 gracias a SWITCHOFFSET)
                 return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
             if hasattr(v, "strftime"):
                 return v.strftime("%Y-%m-%d %H:%M:%S.%f")
-            # Limpiar timezone offset de strings
             return re.sub(r'\s*[+-]\d{2}:\d{2}$', '', str(v))
 
         placeholders = ", ".join(["?" for _ in columns])
@@ -308,45 +305,68 @@ En cualquier otro caso devuelve: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-M
         log = get_session_logger(session_id) if session_id else logging.getLogger(__name__)
         today = datetime.now().strftime("%Y-%m-%d")
 
-        log.info("━" * 60)
-        log.info(f"CONSULTA : {user_message!r}")
-        log.info(f"FRANCHISE: {franchise_code}")
+        log.info("━" * 65)
+        log.info(f"[DataAgent] CONSULTA : {user_message!r}")
+        log.info(f"[DataAgent] FRANCHISE: {franchise_code}")
+        if context:
+            log.info(f"[DataAgent] CONTEXTO : {context[:200]}{'…' if len(context) > 200 else ''}")
 
         total_input = total_output = 0
 
-        # 1. Extraer rango de fechas del mensaje para filtrar en el SP
+        # ── Paso 1: Extraer rango de fechas ───────────────────────────
+        log.info("[DataAgent] (Paso 1) Extrayendo rango de fechas del mensaje…")
         date_from, date_to, date_filter, tok_in, tok_out, clarification = self._extract_date_range(user_message, context)
         total_input += tok_in; total_output += tok_out
 
         if clarification:
-            log.info(f"CLARIF   : {clarification!r}")
-            log.info("━" * 60)
+            log.info(f"[DataAgent] (Paso 1) Solicitud de aclaración al usuario: {clarification!r}")
+            log.info("━" * 65)
             return clarification, total_input, total_output
 
-        log.info(f"FECHAS   : date_from={date_from}  date_to={date_to}")
-        log.info(f"FILTRO   : {date_filter or '(sin filtro de fecha — año completo)'}")
+        log.info(f"[DataAgent] (Paso 1) date_from={date_from}  date_to={date_to}")
+        log.info(f"[DataAgent] (Paso 1) Filtro SQL: {date_filter or '(sin filtro — año completo)'}")
 
-        # 2. Obtener datos de la fuente activa (local db_ventas.db o SP remoto)
+        # ── Paso 2: Obtener datos (local o remoto) ────────────────────
+        from ..db import data_source
+        src_label = "LOCAL db_ventas.db" if data_source.is_local_mode() else "SP sp_GetSalesForChatbot @ Azure/Fabric"
+        log.info(f"[DataAgent] (Paso 2) Consultando fuente: {src_label}")
         sales = data_source.get_sales(franchise_code, date_from=date_from, date_to=date_to)
-        src = "LOCAL db_ventas.db" if data_source.is_local_mode() else "SP sp_GetSalesForChatbot"
-        log.info(f"DATA SRC : {src} → {len(sales)} filas devueltas")
+        log.info(f"[DataAgent] (Paso 2) Filas recibidas: {len(sales)}")
 
-        # 3. Cargar en SQLite en memoria
+        # ── Paso 3: Cargar en SQLite en RAM + preview tabular ─────────
+        log.info("[DataAgent] (Paso 3) Volcando datos en SQLite RAM…")
         mem_conn = self._load_into_memory(sales)
 
-        # 4. LLM genera SQL
+        if sales:
+            cols_preview = list(sales[0].keys())
+            log.info(f"[DataAgent] (Paso 3) Columnas: {cols_preview}")
+            log.info("[DataAgent] (Paso 3) Preview — primeras 5 filas:")
+            for i, row in enumerate(sales[:5], 1):
+                preview_fields = {
+                    k: str(v)[:40] for k, v in row.items()
+                    if k in ("id", "UserName", "SaleDateTimeUtc", "ArticleDescription", "Quantity", "UnitPriceFix")
+                }
+                log.info(f"[DataAgent]   fila {i}: {preview_fields}")
+        else:
+            log.info("[DataAgent] (Paso 3) Sin datos para el período — tabla RAM vacía.")
+
+        # ── Paso 4: LLM genera SQL ────────────────────────────────────
+        log.info(f"[DataAgent] (Paso 4) Generando SQL con LLM (total_rows={len(sales)})…")
         sql, tok_in, tok_out = self._generate_sql(user_message, len(sales), today, context)
         total_input += tok_in; total_output += tok_out
-        log.info(f"SQL GEN  :\n{sql}")
+        log.info(f"[DataAgent] (Paso 4) SQL generado:\n{sql}")
 
-        # 5. Ejecutar SQL
+        # ── Paso 5: Ejecutar SQL en RAM ───────────────────────────────
+        log.info("[DataAgent] (Paso 5) Ejecutando SQL en SQLite RAM…")
         columns, rows = self._execute_sql(mem_conn, sql)
         if rows and rows[0] and rows[0][0] and str(rows[0][0]).startswith("Error"):
-            log.warning(f"SQL ERROR: {rows[0]}")
+            log.warning(f"[DataAgent] (Paso 5) ✖ SQL ERROR: {rows[0]}")
         else:
-            log.info(f"SQL ROWS : {len(rows)} filas — columnas: {columns}")
+            log.info(f"[DataAgent] (Paso 5) Resultado: {len(rows)} filas — columnas: {columns}")
+            if rows:
+                log.info(f"[DataAgent] (Paso 5) Primeras 3 filas del resultado: {rows[:3]}")
 
-        # 6. Calcular métricas en Python — filtradas por la misma fecha que el usuario pidió
+        # ── Cálculo de métricas Python ────────────────────────────────
         if date_from and date_to and date_from.date() == date_to.date():
             period_label = date_from.strftime("%d/%m/%Y")
         elif date_from and date_to:
@@ -358,13 +378,14 @@ En cualquier otro caso devuelve: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-M
 
         summary = self._compute_summary(mem_conn, date_filter, period_label)
         mem_conn.close()
-        log.info(f"PERÍODO  : {period_label}")
-        log.info("━" * 60)
+        log.info(f"[DataAgent] Período analizado: {period_label}")
 
-        # 7. LLM formatea la respuesta
+        # ── Paso 6: LLM formatea la respuesta ─────────────────────────
+        log.info("[DataAgent] (Paso 6) Formateando respuesta final con LLM…")
         response_text, tok_in, tok_out = self._format_response(user_message, sql, columns, rows, summary)
         total_input += tok_in; total_output += tok_out
-        log.info(f"TOKENS   : input={total_input}  output={total_output}  total={total_input + total_output}")
+        log.info(f"[DataAgent] TOKENS   : input={total_input}  output={total_output}  total={total_input + total_output}")
+        log.info("━" * 65)
         return response_text, total_input, total_output
 
 

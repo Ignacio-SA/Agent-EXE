@@ -1,8 +1,11 @@
 import json
+import logging
 
 from anthropic import Anthropic
 
 from ..config import settings
+
+_log = logging.getLogger(__name__)
 
 
 class OrchestratorAgent:
@@ -12,8 +15,8 @@ class OrchestratorAgent:
 
     def decide_agent(self, user_message: str, memory_context: str = "") -> dict:
         """
-        Claude Sonnet decide cuál sub-agente activar
-        Retorna: {agent_type, reasoning, params}
+        Claude Sonnet decide cuál sub-agente activar.
+        Retorna: {agent_type, reasoning, should_use_memory, input_tokens, output_tokens}
         """
         system_prompt = """Eres un orquestador de un chatbot de ventas para franquiciados. Clasifica el mensaje:
 
@@ -40,32 +43,48 @@ Responde SOLO con JSON: {"agent_type": "", "reasoning": "", "should_use_memory":
             messages=[{"role": "user", "content": f"{context}\nMensaje del usuario: {user_message}\n\nResponde SOLO con el JSON, sin texto adicional."}],
         )
 
-        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        usage = {
+            "input_tokens":  response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        }
 
         try:
             text = response.content[0].text.strip()
             # Extraer JSON aunque venga con texto extra
             start = text.find("{")
-            end = text.rfind("}") + 1
+            end   = text.rfind("}") + 1
             result = json.loads(text[start:end])
             result.update(usage)
+
+            _log.debug(
+                "[Orchestrator] LLM response raw: agent=%s | reasoning=%s",
+                result.get("agent_type"),
+                result.get("reasoning"),
+            )
             return result
-        except:
-            pass
+
+        except Exception:
+            _log.warning("[Orchestrator] No se pudo parsear JSON del LLM — activando keyword fallback")
 
         # Fallback por palabras clave si el LLM no retorna JSON válido
         keywords_comparative = ["vs", "versus", "comparar", "compará", "comparación", "diferencia entre", "contra"]
         keywords_data = ["venta", "ventas", "producto", "artículo", "reporte", "turno",
                          "pos", "cantidad", "precio", "franquicia", "ingreso", "ticket"]
         keywords_interaction = ["hola", "gracias", "ayuda", "cómo funciona", "que puedes hacer"]
-        msg_lower = user_message.lower()
-        if any(k in msg_lower for k in keywords_comparative):
-            return {"agent_type": "comparative", "reasoning": "keyword fallback", "should_use_memory": False, **usage}
-        if any(k in msg_lower for k in keywords_data):
-            return {"agent_type": "data", "reasoning": "keyword fallback", "should_use_memory": False, **usage}
-        if any(k in msg_lower for k in keywords_interaction):
-            return {"agent_type": "interaction", "reasoning": "keyword fallback", "should_use_memory": False, **usage}
 
+        msg_lower = user_message.lower()
+
+        if any(k in msg_lower for k in keywords_comparative):
+            _log.warning("[Orchestrator] Fallback → comparative (keyword match)")
+            return {"agent_type": "comparative", "reasoning": "keyword fallback — comparative", "should_use_memory": False, **usage}
+        if any(k in msg_lower for k in keywords_data):
+            _log.warning("[Orchestrator] Fallback → data (keyword match)")
+            return {"agent_type": "data", "reasoning": "keyword fallback — data", "should_use_memory": False, **usage}
+        if any(k in msg_lower for k in keywords_interaction):
+            _log.warning("[Orchestrator] Fallback → interaction (keyword match)")
+            return {"agent_type": "interaction", "reasoning": "keyword fallback — interaction", "should_use_memory": False, **usage}
+
+        _log.warning("[Orchestrator] Fallback → off_topic (default)")
         return {"agent_type": "off_topic", "reasoning": "Default fallback", "should_use_memory": False, **usage}
 
 

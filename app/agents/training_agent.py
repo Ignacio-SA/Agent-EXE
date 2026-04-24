@@ -25,6 +25,12 @@ class TrainingAgent:
     ) -> tuple[str, int, int]:
         log = get_session_logger(session_id) if session_id else logging.getLogger(__name__)
 
+        log.info("─" * 65)
+        log.info(f"[TrainingAgent] (Paso 1) Analizando feedback — tipo: {feedback_type.upper()}")
+        log.info(f"[TrainingAgent] (Paso 1) Feedback recibido: {feedback!r}")
+        log.info(f"[TrainingAgent] (Paso 1) Mensaje original del usuario: {user_message[:150]!r}")
+        log.info(f"[TrainingAgent] (Paso 1) Respuesta del bot que se evalúa: {bot_response[:150]!r}…")
+
         response = self.client.messages.create(
             model=self.model,
             max_tokens=600,
@@ -54,12 +60,24 @@ Criterios de prioridad:
             }],
         )
 
-        tok_in = response.usage.input_tokens
+        tok_in  = response.usage.input_tokens
         tok_out = response.usage.output_tokens
 
         try:
             text = response.content[0].text.strip()
             data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+
+            # Paso 2: disección del feedback
+            log.info(f"[TrainingAgent] (Paso 2) Clasificación LLM:")
+            log.info(f"[TrainingAgent] (Paso 2) Tipo     : {feedback_type.upper()}")
+            log.info(f"[TrainingAgent] (Paso 2) Componente afectado: {data.get('component', 'unknown')}")
+
+            # Paso 3: causa raíz
+            log.info(f"[TrainingAgent] (Paso 3) Causa raíz identificada: {data.get('root_cause', '—')}")
+
+            # Paso 4: sugerencia
+            log.info(f"[TrainingAgent] (Paso 4) Sugerencia de mejora: {data.get('suggestion', '—')}")
+            log.info(f"[TrainingAgent] (Paso 4) Prioridad: {data.get('priority', 'media').upper()}")
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M")
             entry_text = (
@@ -76,19 +94,22 @@ Criterios de prioridad:
             )
 
             training_memory.add_suggestion(entry_text, {
-                "type": feedback_type,
-                "component": data.get("component", "unknown"),
+                "type":       feedback_type,
+                "component":  data.get("component", "unknown"),
                 "suggestion": data.get("suggestion", ""),
-                "priority": data.get("priority", "media"),
+                "priority":   data.get("priority", "media"),
             })
 
+            # Paso 5: confirmación
             log.info(
-                f"TRAINING: {feedback_type} | {data.get('component')} | prioridad {data.get('priority')}"
+                f"[TrainingAgent] (Paso 5) ✔ Sugerencia almacenada en RAM y disco — "
+                f"componente: {data.get('component')} | prioridad: {data.get('priority')}"
             )
+            log.info("─" * 65)
             return entry_text, tok_in, tok_out
 
         except Exception as e:
-            log.warning(f"TRAINING parse error: {e}")
+            log.warning(f"[TrainingAgent] ✖ Error al parsear respuesta LLM: {e}")
             return "", tok_in, tok_out
 
 
