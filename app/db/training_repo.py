@@ -1,10 +1,12 @@
 import os
 import re
 
-_LOG_PATH = os.environ.get(
-    "TRAINING_LOG_PATH",
-    os.path.join(os.path.dirname(__file__), "..", "..", "context", "training_log.md"),
-)
+def _log_path() -> str:
+    return os.environ.get(
+        "TRAINING_LOG_PATH",
+        os.path.join(os.path.dirname(__file__), "..", "..", "context", "training_log.md"),
+    )
+
 _MAX_ENTRIES = 20
 _MAX_CONTEXT_CHARS = 2000
 
@@ -33,9 +35,10 @@ class TrainingMemory:
 
     def _load_from_disk(self):
         try:
-            if not os.path.exists(_LOG_PATH):
+            path = _log_path()
+            if not os.path.exists(path):
                 return
-            with open(_LOG_PATH, encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 content = f.read()
             raw_entries = content.split("## [")
             entries = []
@@ -52,7 +55,7 @@ class TrainingMemory:
         if len(self._suggestions) > _MAX_ENTRIES:
             self._suggestions = self._suggestions[-_MAX_ENTRIES:]
         try:
-            with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            with open(_log_path(), "a", encoding="utf-8") as f:
                 f.write("\n" + entry_text + "\n")
         except Exception:
             pass
