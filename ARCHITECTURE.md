@@ -9,6 +9,7 @@
 6. [Bases de datos](#6-bases-de-datos)
 7. [Variables de entorno](#7-variables-de-entorno)
 8. [Decisiones de diseño](#8-decisiones-de-diseño)
+9. [Modo híbrido: db_ventas.db local vs SP remoto](#9-modo-híbrido-db_ventasdb-local-vs-sp-remoto)
 
 ---
 
@@ -41,7 +42,9 @@ Agent-EXE/
 │   │   └── training_agent.py      # Analiza feedback, escribe training_log.md
 │   ├── db/
 │   │   ├── connection.py          # Conexión Azure AD a Fabric (pyodbc)
-│   │   ├── sales_repo.py          # Ejecuta sp_GetSalesForChatbot
+│   │   ├── data_source.py         # ★ Selector híbrido local/remoto — punto de entrada único
+│   │   ├── local_sales_repo.py    # ★ Repositorio local: carga db_ventas.db en RAM
+│   │   ├── sales_repo.py          # Ejecuta sp_GetSalesForChatbot (modo remoto)
 │   │   ├── memory_repo.py         # CRUD sesiones/mensajes/token-logs (SQLite)
 │   │   └── training_repo.py       # TrainingMemory singleton (RAM + disco)
 │   ├── models/
@@ -59,6 +62,11 @@ Agent-EXE/
 │   └── Nacho.svg
 ├── logs/                          # Logs por sesión (auto-generado)
 ├── memory.db                      # SQLite local (auto-generado)
+├── db_ventas.db                   # ★ Opcional: si existe activa el modo LOCAL
+├── data/                          # Carpeta junto al .exe (auto-generada)
+│   ├── memory.db
+│   ├── db_ventas.db               # ★ Opcional: modo LOCAL en producción compilada
+│   └── logs/
 ├── .env / .env.example
 └── requirements.txt
 ```
@@ -314,8 +322,9 @@ Solo se incluyen entradas de prioridad `alta` y `media`. Límite: ~2000 chars (~
 
 | Base de datos | Tecnología | Dónde vive | Para qué |
 |---|---|---|---|
-| Warehouse | Microsoft Fabric | Cloud | Datos de ventas (fuente de verdad) |
-| SQLite en memoria | sqlite3 | RAM del servidor | Tabla temporal por consulta |
+| Warehouse | Microsoft Fabric | Cloud | Datos de ventas (fuente de verdad — modo remoto) |
+| db_ventas.db | SQLite (archivo) | Raíz del proyecto **o** `data/` junto al .exe | Datos de ventas locales — activa el **modo LOCAL** |
+| SQLite en memoria | sqlite3 | RAM del servidor | Tabla temporal por consulta (ambos modos) |
 | SQLite local | sqlite3 | `memory.db` | Sesiones, historial, token logs |
 | training_log.md | Markdown | `context/` | Log append-only de sugerencias |
 
@@ -389,3 +398,144 @@ Header y detalle pueden tener timestamps que caen en días distintos. El filtro 
 ### ¿Por qué se excluyen tickets cancelados en el SP?
 
 Spark excluye canceladas via `Cloud_StateHistory WHERE Code = 'Cancelled'`. El SP replica esto con `CROSS APPLY OPENJSON(StateHistory)`. Sin este filtro el conteo no coincide con los reportes.
+
+---
+
+## 9. Modo híbrido: db_ventas.db local vs SP remoto
+
+### Concepto
+
+El sistema puede operar en dos modos excluyentes, elegidos automáticamente **al arrancar** la aplicación:
+
+| Modo | Activación | Fuente de datos | Latencia |
+|---|---|---|---|
+| **LOCAL** | `db_ventas.db` presente en disco | SQLite cargado en RAM | ~0 ms (RAM pura) |
+| **REMOTO** | `db_ventas.db` ausente | `sp_GetSalesForChatbot` en Azure/Fabric | 2-10 seg |
+
+Una vez elegido el modo, **no cambia** durante la vida del proceso. Para cambiar de modo hay que detener y reiniciar la app.
+
+---
+
+### Flujo de decisión al inicio
+
+```
+app.main módulo cargando
+        │
+        ▼
+init_data_source()   ← app/db/data_source.py
+        │
+        ├─ [LOG] "Buscando archivo db_ventas.db…"
+        │
+        ├─ ¿existe db_ventas.db?
+        │     │
+        │     ├─ SÍ → [LOG] "✔ Encontrado: <ruta>"
+        │     │       [LOG] "MODO LOCAL activado — NO se ejecutará el Store Procedure"
+        │     │       LocalSalesRepository.load() → carga TODAS las filas en RAM
+        │     │       _mode = "local"
+        │     │
+        │     └─ NO → [LOG] "db_ventas.db no encontrado — MODO REMOTO activado"
+        │               _mode = "remote"
+        │
+        ▼
+Toda consulta posterior → data_source.get_sales()
+        ├─ mode=local  → filtra en RAM (LocalSalesRepository)
+        └─ mode=remote → llama sales_repo.get_sales() → SP Azure
+```
+
+---
+
+### Rutas de búsqueda de db_ventas.db
+
+El sistema busca en este orden de prioridad:
+
+1. `<exe_dir>/data/db_ventas.db` — carpeta `data/` junto al `.exe` (producción)
+2. `<exe_dir>/db_ventas.db` — raíz junto al `.exe` (alternativa producción)
+3. `<project_root>/db_ventas.db` — raíz del proyecto (desarrollo local)
+
+Donde `exe_dir` es:
+- En `.exe` compilado: carpeta donde vive el `.exe`
+- En desarrollo: carpeta donde vive `launcher.py` / `sys.argv[0]`
+
+---
+
+### Componentes involucrados
+
+| Archivo | Responsabilidad |
+|---|---|
+| `app/db/data_source.py` | Selector. Decide el modo, inicializa repo y expone `get_sales()` unificado |
+| `app/db/local_sales_repo.py` | Carga db_ventas.db en RAM. Filtra en Python. Mismo contrato que `SalesRepository` |
+| `app/db/sales_repo.py` | Repositorio remoto. Sin cambios — solo se usa si modo=remoto |
+| `app/main.py` | Llama `init_data_source()` antes de validar ODBC/credenciales |
+| `app/agents/data_agent.py` | Usa `data_source.get_sales()` en vez de `sales_repo` directamente |
+| `app/agents/comparative_agent.py` | Ídem |
+
+---
+
+### Estructura de db_ventas.db
+
+`db_ventas.db` debe tener una tabla llamada `ventas` con exactamente las mismas columnas que devuelve `sp_GetSalesForChatbot`. Los valores de `SaleDateTimeUtc` deben ser strings ISO (`YYYY-MM-DD HH:MM:SS.ffffff`) — ya no vienen como DATETIMEOFFSET de 20 bytes porque son SQLite nativos.
+
+Esquema mínimo esperado:
+```sql
+CREATE TABLE ventas (
+    id               TEXT,
+    FranchiseeCode   TEXT,
+    ShiftCode        TEXT,
+    PosCode          TEXT,
+    UserName         TEXT,
+    SaleDateTimeUtc  TEXT,   -- ISO string: '2025-03-15 14:23:00.000000'
+    Quantity         REAL,
+    ArticleId        TEXT,
+    ArticleDescription TEXT,
+    TypeDetail       TEXT,
+    UnitPriceFix     REAL
+    -- ... resto de columnas del SP
+);
+```
+
+> **Nota:** `LocalSalesRepository` también intentará filtrar por `FranchiseCode` (sin "e") si `FranchiseeCode` no existe, para mayor compatibilidad.
+
+---
+
+### Logs de referencia
+
+Al arrancar con `db_ventas.db` presente:
+```
+[DATA-SOURCE] Buscando archivo db_ventas.db…
+[DATA-SOURCE] ✔ Encontrado: C:\SmartIA\data\db_ventas.db
+[DATA-SOURCE] MODO LOCAL activado — NO se ejecutará el Store Procedure. Trabajando con db_ventas.db en RAM.
+[LOCAL-DB]    Cargando db_ventas.db en RAM…
+[LOCAL-DB]    db_ventas.db cargada en RAM: 48321 filas, 312 ms
+```
+
+Al arrancar sin `db_ventas.db`:
+```
+[DATA-SOURCE] Buscando archivo db_ventas.db…
+[DATA-SOURCE] db_ventas.db no encontrado — MODO REMOTO activado. Se usará sp_GetSalesForChatbot en Azure/Fabric.
+```
+
+En cada consulta (modo local):
+```
+DATA SRC : LOCAL db_ventas.db → 1842 filas devueltas
+```
+
+En cada consulta (modo remoto):
+```
+DATA SRC : SP sp_GetSalesForChatbot → 1842 filas devueltas
+```
+
+---
+
+### Decisión de diseño: carga total en RAM al inicio
+
+El SP ya opera por RAM (los datos llegan, se cargan en SQLite `:memory:` y se consultan ahí). Para mantener la misma velocidad en modo local, `LocalSalesRepository` carga **todo** `db_ventas.db` en RAM al inicializar — sin TTL ni caducidad. El filtrado es puro Python sobre una lista de dicts en memoria.
+
+Ventajas:
+- Latencia de consulta: < 5 ms (sin I/O)
+- Sin dependencia de pyodbc, driver ODBC, ni credenciales Azure
+- Comportamiento idéntico al modo remoto desde la perspectiva de los agentes
+
+Contrapartida:
+- La RAM usada es proporcional al tamaño de `db_ventas.db` (≈ 25 MB comprimido → ~80-150 MB en RAM según las columnas)
+- Los datos no se refrescan en caliente; si `db_ventas.db` se actualiza hay que reiniciar la app
+

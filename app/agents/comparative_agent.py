@@ -5,7 +5,7 @@ from datetime import datetime
 from anthropic import Anthropic
 
 from ..config import settings
-from ..db.sales_repo import sales_repo
+from ..db import data_source
 from ..logger import get_session_logger
 from .data_agent import data_agent
 
@@ -152,11 +152,12 @@ Nunca mostres nombres técnicos de columnas ni códigos internos.""",
         log.info(f"PERÍODO A  : {period_a['label']} ({period_a['date_from'].date()} → {period_a['date_to'].date()})")
         log.info(f"PERÍODO B  : {period_b['label']} ({period_b['date_from'].date()} → {period_b['date_to'].date()})")
 
-        # 2. Un solo llamado al SP con el rango completo
+        # 2. Un solo llamado a la fuente activa con el rango completo
         global_from = min(period_a["date_from"], period_b["date_from"])
         global_to = max(period_a["date_to"], period_b["date_to"])
-        sales = sales_repo.get_sales(franchise_code, date_from=global_from, date_to=global_to)
-        log.info(f"SP ROWS    : {len(sales)} filas para el rango completo")
+        sales = data_source.get_sales(franchise_code, date_from=global_from, date_to=global_to)
+        src = "LOCAL db_ventas.db" if data_source.is_local_mode() else "SP sp_GetSalesForChatbot"
+        log.info(f"DATA SRC   : {src} → {len(sales)} filas para el rango completo")
 
         # 3. Cargar en SQLite (reutiliza DataAgent)
         mem_conn = data_agent._load_into_memory(sales)

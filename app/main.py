@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
+from .db.data_source import init_data_source, is_local_mode
 from .db.memory_repo import init_memory_db
 from .db.training_repo import training_memory  # noqa: F401 — carga el log al iniciar
 from .routers import chat, debug
@@ -24,18 +25,25 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
+# ── Fuente de datos híbrida: local (db_ventas.db en RAM) o remota (SP Azure) ──
+# Esta llamada debe hacerse ANTES de cualquier validación de DB remota,
+# ya que en modo local no se necesitan credenciales ni driver ODBC.
+init_data_source()
+
 # Validar variables críticas al iniciar
 if not settings.anthropic_api_key:
     raise RuntimeError("ANTHROPIC_API_KEY no está configurada en el archivo .env")
 
-if settings.db_auth_mode == "sql" and not settings.db_password:
-    raise RuntimeError("DB_PASSWORD no está configurada en el archivo .env")
+if not is_local_mode():
+    # Solo validar credenciales y driver ODBC cuando se usa el SP remoto
+    if settings.db_auth_mode == "sql" and not settings.db_password:
+        raise RuntimeError("DB_PASSWORD no está configurada en el archivo .env")
 
-from .db.connection import _check_odbc_driver  # noqa: E402
-try:
-    _check_odbc_driver()
-except Exception as e:
-    raise RuntimeError(str(e)) from e
+    from .db.connection import _check_odbc_driver  # noqa: E402
+    try:
+        _check_odbc_driver()
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
 
 app = FastAPI(
     title="Chatbot Multi-Agente",

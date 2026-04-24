@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
 
 from ..config import settings
-from ..db.sales_repo import sales_repo
+from ..db import data_source
 from ..logger import get_session_logger
 
 _RULES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "context", "business_rules.md")
@@ -326,9 +326,10 @@ En cualquier otro caso devuelve: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-M
         log.info(f"FECHAS   : date_from={date_from}  date_to={date_to}")
         log.info(f"FILTRO   : {date_filter or '(sin filtro de fecha — año completo)'}")
 
-        # 2. Obtener datos del SP (solo el rango necesario)
-        sales = sales_repo.get_sales(franchise_code, date_from=date_from, date_to=date_to)
-        log.info(f"SP ROWS  : {len(sales)} filas devueltas por sp_GetSalesForChatbot")
+        # 2. Obtener datos de la fuente activa (local db_ventas.db o SP remoto)
+        sales = data_source.get_sales(franchise_code, date_from=date_from, date_to=date_to)
+        src = "LOCAL db_ventas.db" if data_source.is_local_mode() else "SP sp_GetSalesForChatbot"
+        log.info(f"DATA SRC : {src} → {len(sales)} filas devueltas")
 
         # 3. Cargar en SQLite en memoria
         mem_conn = self._load_into_memory(sales)
