@@ -28,6 +28,7 @@ class OrchestratorAgent:
 
 REGLA CRÍTICA: Frases como "el período que mencioné", "anteriormente", "lo que te pedí antes", "el mismo rango" son referencias a contexto de conversación, NO evaluaciones de calidad. Clasifica esos mensajes como "data" o "comparative" según corresponda.
 REGLA DE CLARIFICACIÓN: Si el contexto previo muestra que el bot hizo una pregunta de aclaración sobre fechas o año ("¿A qué año te referís?", "¿2025 o 2026?"), y el mensaje del usuario es una respuesta corta ("2025", "el año pasado", "ese año", "2026"), clasificar como "data" o "comparative" según el tipo de consulta original en el contexto.
+REGLA DE CONTEXTO (FOLLOW-UPS): Si el mensaje es una continuación lógica del chat anterior (ej: "y por medios de pago", "desglosá eso", "mostrame el detalle") y el contexto trataba sobre ventas o datos, clasifícalo INVARIABLEMENTE como "data" (o "comparative" si el follow-up implica comparación), incluso si el mensaje actual no tiene la palabra "ventas" ni fechas explícitas.
 REGLA DE PRIORIDAD: Si el mensaje mezcla contenido de negocio con contenido off-topic, clasificar siempre por la parte de negocio e ignorar el resto. "off_topic" es el último recurso.
 Si hay duda entre "comparative" y "data", usar "comparative".
 Si hay duda entre "data" e "interaction", usar "data".

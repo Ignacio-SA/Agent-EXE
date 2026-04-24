@@ -262,21 +262,83 @@ Reglas de presentación:
                 0, 0, "",
             )
 
-        # LLM como fallback para fechas específicas ("25 de marzo", "del 1 al 15", etc.)
-        context_hint = f"\nContexto de conversación previa:\n{context}\n" if context else ""
+        # ── Paso Python extra: recuperar fecha del contexto en follow-ups ──────────
+        # Señales de que el mensaje es una continuación sin fecha propia
+        _FOLLOWUP_STARTS = (
+            "y ", "y como", "y cuál", "y cuanto", "y qué", "y que",
+            "también", "ademas", "además", "ahora", "en ese", "del mismo",
+            "de ese", "ese día", "esa fecha", "en facturación", "por monto",
+            "desglosá", "desglose", "mostrame", "muéstrame", "detallame",
+            "y el", "y la", "y los", "y las",
+        )
+        _no_date_keywords = not any(
+            k in msg for k in [
+                "hoy", "ayer", "semana", "mes", "año", "enero", "febrero",
+                "marzo", "abril", "mayo", "junio", "julio", "agosto",
+                "septiembre", "octubre", "noviembre", "diciembre",
+                "/", "-", "al ", "del ", "desde", "hasta",
+            ]
+        )
+        _is_followup = _no_date_keywords and (
+            len(user_message.strip()) < 70
+            or any(msg.strip().startswith(s) for s in _FOLLOWUP_STARTS)
+        )
+
+        if _is_followup and context:
+            import re as _re
+            # Buscar fechas ISO: YYYY-MM-DD
+            iso_found = _re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', context)
+            # Buscar fechas DD/MM/YYYY y convertirlas a ISO
+            slash_found = _re.findall(r'\b(\d{2}/\d{2}/\d{4})\b', context)
+            for sf in slash_found:
+                d, m, y = sf.split("/")
+                iso_found.append(f"{y}-{m}-{d}")
+
+            # Extraer rangos (pares de fechas consecutivas)
+            valid_pairs: list[tuple] = []
+            valid_singles: list = []
+            for ds in iso_found:
+                try:
+                    valid_singles.append(date.fromisoformat(ds))
+                except Exception:
+                    pass
+
+            if valid_singles:
+                # Usar el rango más reciente: si hay 2+ fechas distintas usamos min/max del par más reciente
+                unique = sorted(set(valid_singles))
+                if len(unique) >= 2:
+                    df_date, dt_date = unique[0], unique[-1]
+                    date_filter = (
+                        f"DATE(SaleDateTimeUtc) = '{df_date.isoformat()}'"
+                        if df_date == dt_date
+                        else f"DATE(SaleDateTimeUtc) BETWEEN '{df_date.isoformat()}' AND '{dt_date.isoformat()}'"
+                    )
+                    return (
+                        datetime.combine(df_date, datetime.min.time()),
+                        datetime.combine(dt_date, datetime.max.time().replace(microsecond=0)),
+                        date_filter, 0, 0, "",
+                    )
+                else:
+                    # Un solo día en el contexto — reusar ese día
+                    ctx_date = unique[0]
+                    return (*day_range(ctx_date), 0, 0, "")
+
+        # ── LLM fallback para fechas específicas ────────────────────────────────
+        # (solo llega aquí si Python no pudo extraer nada del contexto)
+        context_hint = f"\n\nCONTEXTO DE CONVERSACIÓN PREVIA (leer para inferir período):\n{context}\n" if context else ""
         response = self.client.messages.create(
             model=self.model,
             max_tokens=80,
             temperature=0,
             system=f"""Hoy es {today}. Extrae el rango de fechas para responder la consulta del usuario.
 
-REGLA PRINCIPAL: Si el mensaje actual es corto o no menciona fecha, usa el período más reciente del contexto previo. NUNCA retornes null si el contexto menciona fechas o períodos.
+REGLA OBLIGATORIA N°1: Si el mensaje actual NO menciona ninguna fecha ni período (es decir, es una continuación o follow-up), DEBES extraer la fecha del CONTEXTO DE CONVERSACIÓN PREVIA. Jamás retornes null cuando el contexto contiene fechas.
 
-REGLA DE AMBIGÜEDAD: Si el mensaje menciona un mes o período sin año (ej: "en marzo", "de enero a febrero") y no se puede determinar con certeza si es {today.year} o {today.year - 1}, devuelve:
+REGLA OBLIGATORIA N°2: Si el mensaje menciona un mes sin año (ej: "en marzo") y no es claro si es {today.year} o {today.year - 1}, devuelve:
 {{"date_from": null, "date_to": null, "clarification": "¿A qué año te referís, {today.year - 1} o {today.year}?"}}
 
-Solo retorna null sin clarification si no hay absolutamente ninguna fecha ni en el mensaje ni en el contexto.
-En cualquier otro caso devuelve: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}}{context_hint}""",
+Solo retorna null sin clarification si NO hay absolutamente ninguna fecha ni en el mensaje ni en el contexto.
+En cualquier otro caso devuelve SIEMPRE: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}}{context_hint}""",
             messages=[{"role": "user", "content": user_message}],
         )
         llm_in, llm_out = response.usage.input_tokens, response.usage.output_tokens
@@ -300,6 +362,7 @@ En cualquier otro caso devuelve: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-M
             pass
 
         return None, None, "", llm_in, llm_out, ""
+
 
     def process_data_request(self, user_message: str, franchise_code: str, context: str = "", session_id: str = "") -> tuple[str, int, int]:
         log = get_session_logger(session_id) if session_id else logging.getLogger(__name__)
