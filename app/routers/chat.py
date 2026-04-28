@@ -7,11 +7,14 @@ from fastapi.responses import JSONResponse
 
 from ..agents.comparative_agent import comparative_agent
 from ..agents.data_agent import data_agent
+from ..agents.franchise_resolver import franchise_resolver
 from ..agents.interaction import interaction_agent
 from ..agents.memory_agent import memory_agent
 from ..agents.orchestrator import orchestrator
+from ..agents.session_context import session_context
 from ..agents.training_agent import training_agent
 from ..config import settings
+from ..db import data_source as _data_source
 from ..db.training_repo import training_memory
 from ..logger import get_session_logger
 from ..models.schemas import ChatRequest, ChatResponse, FeedbackRequest, FeedbackResponse, HistoryEntry
@@ -72,21 +75,54 @@ async def chat(request: ChatRequest):
         orch_out = decision.get("output_tokens", 0)
 
         # ──────────────────────────────────────────────────────────────
+        # [FranchiseResolver] Resolución de franquicia(s)
+        # ──────────────────────────────────────────────────────────────
+        log.info("─" * 65)
+        franchise_map = _data_source.get_available_franchises()
+        resolved_codes, fr_clarification, is_franchise_compare = franchise_resolver.resolve(
+            request.message, memory_context, franchise_map, agent_type,
+            session_franchise=session_context.get_franchise(request.session_id),
+        )
+        log.info(
+            f"[FranchiseResolver] codes={resolved_codes}  clarification={bool(fr_clarification)}  "
+            f"franchise_compare={is_franchise_compare}"
+        )
+
+        # ──────────────────────────────────────────────────────────────
         # Invocar agente correspondiente
         # ──────────────────────────────────────────────────────────────
         log.info("─" * 65)
         agent_in = agent_out = 0
 
-        if agent_type == "comparative":
-            log.info("[ComparativeAgent] ▶ Iniciando agente comparativo…")
+        # Guardar franquicia resuelta para follow-ups de esta sesión
+        if resolved_codes and not fr_clarification:
+            session_context.set_franchise(request.session_id, resolved_codes)
+
+        if fr_clarification:
+            # Franquicia ambigua — devolver la pregunta de aclaración
+            log.info("[FranchiseResolver] Devolviendo aclaración de franquicia al usuario.")
+            response_text = fr_clarification
+
+        elif is_franchise_compare:
+            # Comparación directa entre franquicias
+            log.info("[ComparativeAgent] ▶ Iniciando comparación entre franquicias…")
+            response_text, agent_in, agent_out = comparative_agent.process_franchise_comparison(
+                request.message, franchise_map, memory_context, request.session_id
+            )
+            agent_type = "franchise_compare"
+
+        elif agent_type == "comparative":
+            franchise_codes = resolved_codes or list(franchise_map.keys())
+            log.info(f"[ComparativeAgent] ▶ Iniciando agente comparativo — franchises: {franchise_codes}")
             response_text, agent_in, agent_out = comparative_agent.process_comparative_request(
-                request.message, settings.franchise_code, memory_context, request.session_id
+                request.message, franchise_codes, memory_context, request.session_id
             )
 
         elif agent_type == "data":
-            log.info("[DataAgent] ▶ Iniciando agente de datos (Text-to-SQL)…")
+            franchise_codes = resolved_codes or list(franchise_map.keys())
+            log.info(f"[DataAgent] ▶ Iniciando agente de datos (Text-to-SQL) — franchises: {franchise_codes}")
             response_text, agent_in, agent_out = data_agent.process_data_request(
-                request.message, settings.franchise_code, memory_context, request.session_id
+                request.message, franchise_codes, memory_context, request.session_id
             )
 
         elif agent_type == "feedback":

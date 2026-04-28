@@ -2,14 +2,16 @@ import logging
 import os
 import re
 import sqlite3
-import struct
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from anthropic import Anthropic
 
 from ..config import settings
 from ..db import data_source
+from ..db.sales_analytics import compute_summary, load_into_memory
 from ..logger import get_session_logger
+from .date_resolver import date_resolver
+from .session_context import session_context
 
 _RULES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "context", "business_rules.md")
 
@@ -30,53 +32,13 @@ class DataAgent:
         self.client = Anthropic(api_key=settings.anthropic_api_key, max_retries=3)
         self.model = "claude-haiku-4-5-20251001"
 
-    def _load_into_memory(self, sales: list[dict]) -> sqlite3.Connection:
-        """Carga los datos del SP/DB local en una tabla SQLite en memoria."""
-        conn = sqlite3.connect(":memory:")
-        if not sales:
-            conn.execute("""
-                CREATE TABLE ventas (
-                    id TEXT, FranchiseeCode TEXT, ShiftCode TEXT, PosCode TEXT,
-                    UserName TEXT, SaleDateTimeUtc TEXT, Quantity REAL,
-                    ArticleId TEXT, ArticleDescription TEXT, TypeDetail TEXT, UnitPriceFix REAL
-                )
-            """)
-            return conn
-
-        columns = list(sales[0].keys())
-        cols_def = ", ".join([f'"{c}" TEXT' for c in columns])
-        conn.execute(f"CREATE TABLE ventas ({cols_def})")
-
-        def fmt(v):
-            if v is None:
-                return None
-            # DATETIMEOFFSET llega como bytes raw del ODBC driver (20 bytes)
-            if isinstance(v, (bytes, bytearray)) and len(v) == 20:
-                year, month, day, hour, minute, second, fraction, tz_h, tz_m = struct.unpack('<hHHHHHIhh', v)
-                microsecond = fraction // 1000
-                tz = timezone(timedelta(hours=tz_h, minutes=tz_m))
-                dt = datetime(year, month, day, hour, minute, second, microsecond, tzinfo=tz)
-                return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-            if hasattr(v, "strftime"):
-                return v.strftime("%Y-%m-%d %H:%M:%S.%f")
-            return re.sub(r'\s*[+-]\d{2}:\d{2}$', '', str(v))
-
-        placeholders = ", ".join(["?" for _ in columns])
-        for row in sales:
-            conn.execute(
-                f"INSERT INTO ventas VALUES ({placeholders})",
-                [fmt(v) for v in row.values()],
-            )
-        conn.commit()
-        return conn
-
     def _generate_sql(self, user_message: str, total_rows: int, today: str, context: str = "") -> tuple[str, int, int]:
         """LLM genera el SQL apropiado para la pregunta del usuario."""
         business_rules = _BUSINESS_RULES
         context_block = f"\nCONTEXTO DE CONVERSACIÓN PREVIA:\n{context}\n" if context else ""
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=300,
+            max_tokens=600,
             temperature=0,
             system=f"""Eres un experto en SQL. Genera UNA sola consulta SQL para responder la pregunta del usuario.
 
@@ -85,7 +47,10 @@ Fecha de hoy: {today}
 {context_block}
 Reglas IMPORTANTES de SQL (SQLite):
 - Responde SOLO con la consulta SQL, sin explicaciones ni markdown ni bloques de código
+- NUNCA uses UNION ALL. El sistema ya calcula automáticamente todos los desgloses (vendedores, productos, canales, medios de pago, días). Generá SIEMPRE una consulta simple y directa.
+- Para informes completos o detallados, generá una consulta de resumen general simple (COUNT DISTINCT id, SUM ventas, etc.) — el desglose completo ya está pre-calculado.
 - Si el mensaje del usuario es muy corto o es una continuación ("en facturación", "por monto", "y en $", "también", etc.), usa el CONTEXTO DE CONVERSACIÓN PREVIA para reconstruir la pregunta completa (misma agrupación, misma fecha, pero con la métrica/dimensión que indica el mensaje).
+- Si el mensaje del usuario es una respuesta a una pregunta de aclaración ("ambas", "las dos", "quiero ambas", "la 1", "la primera", "para las dos", etc.), buscá en el CONTEXTO la consulta original del usuario y generá el SQL para responderla. NUNCA devuelvas texto conversacional en lugar de SQL.
 - La base de datos es SQLite — usa SOLO funciones SQLite:
   * Para año: strftime('%Y', SaleDateTimeUtc)
   * Para mes: strftime('%m', SaleDateTimeUtc)
@@ -96,13 +61,17 @@ Reglas IMPORTANTES de SQL (SQLite):
 - Para "ayer" usa: DATE(SaleDateTimeUtc) = date('{datetime.now().strftime("%Y-%m-%d")}', '-1 day')
 - Para totales usa COUNT o SUM según corresponda
 - NO uses LIMIT salvo que el usuario pida explícitamente un "top N" o "los N más..."
+- Si la pregunta menciona kilos, peso o distribución por peso/kilos, incluí OBLIGATORIAMENTE SUM(CAST(Quantity AS REAL) * CAST(WeightKilos AS REAL)) AS kilos_total en el SELECT, y filtrá WHERE WeightKilos IS NOT NULL AND WeightKilos != ''. Si usás GROUP BY, kilos_total debe estar en el SELECT.
 
 ---
 {business_rules}
 """,
             messages=[{"role": "user", "content": user_message}],
         )
-        return response.content[0].text.strip().strip("```sql").strip("```").strip(), response.usage.input_tokens, response.usage.output_tokens
+        sql = response.content[0].text.strip().strip("```sql").strip("```").strip()
+        if not sql.upper().startswith("SELECT"):
+            sql = "SELECT UserName, COUNT(DISTINCT id) AS transacciones, ROUND(SUM(CAST(Quantity AS REAL)*CAST(UnitPriceFix AS REAL)),2) AS total FROM ventas WHERE \"Type\" != '2' GROUP BY UserName ORDER BY total DESC"
+        return sql, response.usage.input_tokens, response.usage.output_tokens
 
     def _execute_sql(self, mem_conn: sqlite3.Connection, sql: str) -> tuple[list, list]:
         """Ejecuta el SQL generado y retorna columnas + filas."""
@@ -114,84 +83,12 @@ Reglas IMPORTANTES de SQL (SQLite):
         except Exception as e:
             return [], [("Error en SQL", str(e))]
 
-    def _compute_summary(self, mem_conn: sqlite3.Connection, date_filter: str = "", period_label: str = "") -> str:
-        """Calcula todas las métricas en Python (sin LLM) para evitar inconsistencias."""
-        try:
-            base = f"\"Type\" != '2'{' AND ' + date_filter if date_filter else ''}"
-
-            totals = mem_conn.execute(f"""
-                SELECT COUNT(DISTINCT id),
-                       ROUND(SUM(CAST(Quantity AS REAL) * CAST(UnitPriceFix AS REAL)), 2),
-                       COUNT(DISTINCT UserName)
-                FROM ventas WHERE {base}
-            """).fetchone()
-
-            if not totals[0]:
-                return "Sin datos para el período consultado."
-
-            by_vendor = mem_conn.execute(f"""
-                SELECT UserName,
-                       COUNT(DISTINCT id),
-                       ROUND(SUM(CAST(Quantity AS REAL) * CAST(UnitPriceFix AS REAL)), 2)
-                FROM ventas WHERE {base}
-                GROUP BY UserName ORDER BY 3 DESC
-            """).fetchall()
-
-            top_products = mem_conn.execute(f"""
-                SELECT ArticleDescription,
-                       SUM(CAST(Quantity AS REAL)),
-                       ROUND(SUM(CAST(Quantity AS REAL) * CAST(UnitPriceFix AS REAL)), 2)
-                FROM ventas WHERE {base}
-                GROUP BY ArticleDescription ORDER BY 2 DESC LIMIT 10
-            """).fetchall()
-
-            hourly = mem_conn.execute(f"""
-                SELECT strftime('%H', SaleDateTimeUtc),
-                       COUNT(DISTINCT id)
-                FROM ventas WHERE {base}
-                GROUP BY 1 ORDER BY 2 DESC LIMIT 5
-            """).fetchall()
-
-            def fmt(n):
-                return f"${n:,.0f}".replace(",", ".")
-
-            avg_ticket = round(totals[1] / totals[0]) if totals[0] else 0
-
-            period_str = f" — PERÍODO: {period_label}" if period_label else ""
-            lines = [
-                f"=== DATOS PRE-CALCULADOS{period_str} (usar exactamente estos números) ===",
-                "",
-                f"RESUMEN GENERAL:",
-                f"- Transacciones: {totals[0]}",
-                f"- Total ventas: {fmt(totals[1])}",
-                f"- Ticket promedio: {fmt(avg_ticket)}",
-                f"- Vendedores activos: {totals[2]}",
-                "",
-                "POR VENDEDOR:",
-            ]
-            for v in by_vendor:
-                v_ticket = round(v[2] / v[1]) if v[1] else 0
-                lines.append(f"  • {v[0]}: {v[1]} transacciones | {fmt(v[2])} | ticket prom: {fmt(v_ticket)}")
-
-            lines += ["", "TOP PRODUCTOS (por unidades):"]
-            for p in top_products:
-                lines.append(f"  • {p[0]}: {p[1]:.0f} unidades | {fmt(p[2])}")
-
-            lines += ["", "HORAS MÁS ACTIVAS (transacciones únicas):"]
-            for h in hourly:
-                lines.append(f"  • {h[0]}:00 hs — {h[1]} transacciones")
-
-            return "\n".join(lines)
-        except Exception:
-            return ""
-
     def _format_response(self, user_message: str, sql: str, columns: list, rows: list, summary: str) -> tuple[str, int, int]:
         """LLM formatea los resultados en lenguaje natural."""
         business_rules = _BUSINESS_RULES
 
-        # Para respuestas con muchas filas, usar solo los datos pre-calculados
         if len(rows) > 20:
-            data_content = f"(Datos detallados omitidos — usar solo los datos pre-calculados del sistema)"
+            data_content = "(Datos detallados omitidos — usar solo los datos pre-calculados del sistema)"
         else:
             data_content = f"Columnas: {columns}\nResultados: {rows}"
 
@@ -204,6 +101,8 @@ Reglas IMPORTANTES de SQL (SQLite):
 INSTRUCCIÓN CRÍTICA: Los siguientes datos fueron calculados con precisión en Python. Úsalos EXACTAMENTE como aparecen. NO recalcules ni modifiques ningún número.
 
 INSTRUCCIÓN DE PERÍODO: Los datos pre-calculados indican el período exacto analizado. Úsalo siempre al describir los resultados. NUNCA uses "período completo", "datos generales" ni términos vagos si el período está definido.
+
+INSTRUCCIÓN DE KILOS/PESO: Si el resultado SQL contiene columnas de kilos o peso (WeightKilos, kilos, peso), esos valores son la fuente autoritativa. Úsalos directamente SIN estimar ni agregar asteriscos. NUNCA digas que "no tenés el peso exacto" si el resultado SQL ya lo incluye.
 
 Si el mensaje del usuario incluye preguntas no relacionadas con ventas o el negocio, ignóralas por completo. No las menciones ni las respondas.
 
@@ -218,167 +117,34 @@ Reglas de presentación:
         )
         return response.content[0].text, response.usage.input_tokens, response.usage.output_tokens
 
-    def _extract_date_range(self, user_message: str, context: str = "") -> tuple[datetime | None, datetime | None, str, int, int, str]:
-        """Extrae el rango de fechas del mensaje. Retorna (date_from, date_to, date_filter_sql, tok_in, tok_out, clarification)."""
-        import json
-        now = datetime.now()
-        today = now.date()
-        msg = user_message.lower()
-
-        def day_range(d):
-            dt_from = datetime.combine(d, datetime.min.time())
-            dt_to = datetime.combine(d, datetime.max.time().replace(microsecond=0))
-            sql = f"DATE(SaleDateTimeUtc) = '{d.isoformat()}'"
-            return dt_from, dt_to, sql
-
-        # Detección directa en Python — sin LLM, sin fallos (0 tokens)
-        if "hoy" in msg:
-            return (*day_range(today), 0, 0, "")
-        if "ayer" in msg:
-            return (*day_range(today - timedelta(days=1)), 0, 0, "")
-        if "esta semana" in msg:
-            start = today - timedelta(days=today.weekday())
-            return (
-                datetime.combine(start, datetime.min.time()),
-                datetime.combine(today, datetime.max.time().replace(microsecond=0)),
-                f"DATE(SaleDateTimeUtc) >= '{start.isoformat()}'",
-                0, 0, "",
-            )
-        if "semana pasada" in msg:
-            start = today - timedelta(days=today.weekday() + 7)
-            end = start + timedelta(days=6)
-            return (
-                datetime.combine(start, datetime.min.time()),
-                datetime.combine(end, datetime.max.time().replace(microsecond=0)),
-                f"DATE(SaleDateTimeUtc) BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'",
-                0, 0, "",
-            )
-        if "este mes" in msg:
-            start = today.replace(day=1)
-            return (
-                datetime.combine(start, datetime.min.time()),
-                datetime.combine(today, datetime.max.time().replace(microsecond=0)),
-                f"strftime('%Y-%m', SaleDateTimeUtc) = '{today.strftime('%Y-%m')}'",
-                0, 0, "",
-            )
-
-        # ── Paso Python extra: recuperar fecha del contexto en follow-ups ──────────
-        # Señales de que el mensaje es una continuación sin fecha propia
-        _FOLLOWUP_STARTS = (
-            "y ", "y como", "y cuál", "y cuanto", "y qué", "y que",
-            "también", "ademas", "además", "ahora", "en ese", "del mismo",
-            "de ese", "ese día", "esa fecha", "en facturación", "por monto",
-            "desglosá", "desglose", "mostrame", "muéstrame", "detallame",
-            "y el", "y la", "y los", "y las",
-        )
-        _no_date_keywords = not any(
-            k in msg for k in [
-                "hoy", "ayer", "semana", "mes", "año", "enero", "febrero",
-                "marzo", "abril", "mayo", "junio", "julio", "agosto",
-                "septiembre", "octubre", "noviembre", "diciembre",
-                "/", "-", "al ", "del ", "desde", "hasta",
-            ]
-        )
-        _is_followup = _no_date_keywords and (
-            len(user_message.strip()) < 70
-            or any(msg.strip().startswith(s) for s in _FOLLOWUP_STARTS)
-        )
-
-        if _is_followup and context:
-            import re as _re
-            # Buscar fechas ISO: YYYY-MM-DD
-            iso_found = _re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', context)
-            # Buscar fechas DD/MM/YYYY y convertirlas a ISO
-            slash_found = _re.findall(r'\b(\d{2}/\d{2}/\d{4})\b', context)
-            for sf in slash_found:
-                d, m, y = sf.split("/")
-                iso_found.append(f"{y}-{m}-{d}")
-
-            # Extraer rangos (pares de fechas consecutivas)
-            valid_pairs: list[tuple] = []
-            valid_singles: list = []
-            for ds in iso_found:
-                try:
-                    valid_singles.append(date.fromisoformat(ds))
-                except Exception:
-                    pass
-
-            if valid_singles:
-                # Usar el rango más reciente: si hay 2+ fechas distintas usamos min/max del par más reciente
-                unique = sorted(set(valid_singles))
-                if len(unique) >= 2:
-                    df_date, dt_date = unique[0], unique[-1]
-                    date_filter = (
-                        f"DATE(SaleDateTimeUtc) = '{df_date.isoformat()}'"
-                        if df_date == dt_date
-                        else f"DATE(SaleDateTimeUtc) BETWEEN '{df_date.isoformat()}' AND '{dt_date.isoformat()}'"
-                    )
-                    return (
-                        datetime.combine(df_date, datetime.min.time()),
-                        datetime.combine(dt_date, datetime.max.time().replace(microsecond=0)),
-                        date_filter, 0, 0, "",
-                    )
-                else:
-                    # Un solo día en el contexto — reusar ese día
-                    ctx_date = unique[0]
-                    return (*day_range(ctx_date), 0, 0, "")
-
-        # ── LLM fallback para fechas específicas ────────────────────────────────
-        # (solo llega aquí si Python no pudo extraer nada del contexto)
-        context_hint = f"\n\nCONTEXTO DE CONVERSACIÓN PREVIA (leer para inferir período):\n{context}\n" if context else ""
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=80,
-            temperature=0,
-            system=f"""Hoy es {today}. Extrae el rango de fechas para responder la consulta del usuario.
-
-REGLA OBLIGATORIA N°1: Si el mensaje actual NO menciona ninguna fecha ni período (es decir, es una continuación o follow-up), DEBES extraer la fecha del CONTEXTO DE CONVERSACIÓN PREVIA. Jamás retornes null cuando el contexto contiene fechas.
-
-REGLA OBLIGATORIA N°2: Si el mensaje menciona un mes sin año (ej: "en marzo") y no es claro si es {today.year} o {today.year - 1}, devuelve:
-{{"date_from": null, "date_to": null, "clarification": "¿A qué año te referís, {today.year - 1} o {today.year}?"}}
-
-Solo retorna null sin clarification si NO hay absolutamente ninguna fecha ni en el mensaje ni en el contexto.
-En cualquier otro caso devuelve SIEMPRE: {{"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}}{context_hint}""",
-            messages=[{"role": "user", "content": user_message}],
-        )
-        llm_in, llm_out = response.usage.input_tokens, response.usage.output_tokens
-
-        try:
-            text = response.content[0].text.strip()
-            start = text.find("{")
-            data = json.loads(text[start:text.rfind("}") + 1])
-            if data.get("clarification"):
-                return None, None, "", llm_in, llm_out, data["clarification"]
-            if data.get("date_from"):
-                df = datetime.strptime(data["date_from"], "%Y-%m-%d")
-                dt = datetime.strptime(data["date_to"] + " 23:59:59", "%Y-%m-%d %H:%M:%S") if data.get("date_to") else df.replace(hour=23, minute=59, second=59)
-                date_filter = (
-                    f"DATE(SaleDateTimeUtc) = '{data['date_from']}'"
-                    if data["date_from"] == data.get("date_to")
-                    else f"DATE(SaleDateTimeUtc) BETWEEN '{data['date_from']}' AND '{data.get('date_to', today.isoformat())}'"
-                )
-                return df, dt, date_filter, llm_in, llm_out, ""
-        except Exception:
-            pass
-
-        return None, None, "", llm_in, llm_out, ""
-
-
-    def process_data_request(self, user_message: str, franchise_code: str, context: str = "", session_id: str = "") -> tuple[str, int, int]:
+    def process_data_request(
+        self,
+        user_message: str,
+        franchise_codes: list[str],
+        context: str = "",
+        session_id: str = "",
+    ) -> tuple[str, int, int]:
         log = get_session_logger(session_id) if session_id else logging.getLogger(__name__)
         today = datetime.now().strftime("%Y-%m-%d")
 
         log.info("━" * 65)
-        log.info(f"[DataAgent] CONSULTA : {user_message!r}")
-        log.info(f"[DataAgent] FRANCHISE: {franchise_code}")
+        log.info(f"[DataAgent] CONSULTA   : {user_message!r}")
+        log.info(f"[DataAgent] FRANCHISES : {franchise_codes}")
         if context:
-            log.info(f"[DataAgent] CONTEXTO : {context[:200]}{'…' if len(context) > 200 else ''}")
+            log.info(f"[DataAgent] CONTEXTO   : {context[:200]}{'…' if len(context) > 200 else ''}")
 
         total_input = total_output = 0
 
+        franchise_map = (
+            {code: settings.franchise_map.get(code, code[:12] + "...") for code in franchise_codes}
+            if len(franchise_codes) > 1 else None
+        )
+
         # ── Paso 1: Extraer rango de fechas ───────────────────────────
         log.info("[DataAgent] (Paso 1) Extrayendo rango de fechas del mensaje…")
-        date_from, date_to, date_filter, tok_in, tok_out, clarification = self._extract_date_range(user_message, context)
+        date_from, date_to, date_filter, tok_in, tok_out, clarification = date_resolver.resolve(
+            user_message, context, session_id
+        )
         total_input += tok_in; total_output += tok_out
 
         if clarification:
@@ -390,15 +156,14 @@ En cualquier otro caso devuelve SIEMPRE: {{"date_from": "YYYY-MM-DD", "date_to":
         log.info(f"[DataAgent] (Paso 1) Filtro SQL: {date_filter or '(sin filtro — año completo)'}")
 
         # ── Paso 2: Obtener datos (local o remoto) ────────────────────
-        from ..db import data_source
         src_label = "LOCAL db_ventas.db" if data_source.is_local_mode() else "SP sp_GetSalesForChatbot @ Azure/Fabric"
         log.info(f"[DataAgent] (Paso 2) Consultando fuente: {src_label}")
-        sales = data_source.get_sales(franchise_code, date_from=date_from, date_to=date_to)
+        sales = data_source.get_sales(franchise_codes, date_from=date_from, date_to=date_to)
         log.info(f"[DataAgent] (Paso 2) Filas recibidas: {len(sales)}")
 
-        # ── Paso 3: Cargar en SQLite en RAM + preview tabular ─────────
+        # ── Paso 3: Cargar en SQLite en RAM ───────────────────────────
         log.info("[DataAgent] (Paso 3) Volcando datos en SQLite RAM…")
-        mem_conn = self._load_into_memory(sales)
+        mem_conn = load_into_memory(sales)
 
         if sales:
             cols_preview = list(sales[0].keys())
@@ -407,17 +172,35 @@ En cualquier otro caso devuelve SIEMPRE: {{"date_from": "YYYY-MM-DD", "date_to":
             for i, row in enumerate(sales[:5], 1):
                 preview_fields = {
                     k: str(v)[:40] for k, v in row.items()
-                    if k in ("id", "UserName", "SaleDateTimeUtc", "ArticleDescription", "Quantity", "UnitPriceFix")
+                    if k in ("id", "FranchiseeCode", "UserName", "SaleDateTimeUtc", "ArticleDescription", "Quantity", "UnitPriceFix")
                 }
                 log.info(f"[DataAgent]   fila {i}: {preview_fields}")
         else:
             log.info("[DataAgent] (Paso 3) Sin datos para el período — tabla RAM vacía.")
 
         # ── Paso 4: LLM genera SQL ────────────────────────────────────
+        # Enriquecer contexto con último artículo consultado en la sesión
+        last_product = session_context.get_product(session_id) if session_id else None
+        enriched_context = (
+            f"ÚLTIMO ARTÍCULO/PRODUCTO CONSULTADO: {last_product}\n{context}"
+            if last_product else context
+        )
+
         log.info(f"[DataAgent] (Paso 4) Generando SQL con LLM (total_rows={len(sales)})…")
-        sql, tok_in, tok_out = self._generate_sql(user_message, len(sales), today, context)
+        if last_product:
+            log.info(f"[DataAgent] (Paso 4) Último artículo en sesión: {last_product!r}")
+        sql, tok_in, tok_out = self._generate_sql(user_message, len(sales), today, enriched_context)
         total_input += tok_in; total_output += tok_out
         log.info(f"[DataAgent] (Paso 4) SQL generado:\n{sql}")
+
+        # Guardar artículo consultado para follow-ups de la sesión
+        if session_id:
+            m = re.search(
+                r'ArticleDescription\s+(?:LIKE\s+["\']%?([^%"\']+)%?["\']|=\s+["\']([^"\']+)["\'])',
+                sql, re.IGNORECASE,
+            )
+            if m:
+                session_context.set_product(session_id, (m.group(1) or m.group(2)).strip())
 
         # ── Paso 5: Ejecutar SQL en RAM ───────────────────────────────
         log.info("[DataAgent] (Paso 5) Ejecutando SQL en SQLite RAM…")
@@ -439,7 +222,7 @@ En cualquier otro caso devuelve SIEMPRE: {{"date_from": "YYYY-MM-DD", "date_to":
         else:
             period_label = "año completo"
 
-        summary = self._compute_summary(mem_conn, date_filter, period_label)
+        summary = compute_summary(mem_conn, date_filter, period_label, franchise_map)
         mem_conn.close()
         log.info(f"[DataAgent] Período analizado: {period_label}")
 
@@ -447,7 +230,7 @@ En cualquier otro caso devuelve SIEMPRE: {{"date_from": "YYYY-MM-DD", "date_to":
         log.info("[DataAgent] (Paso 6) Formateando respuesta final con LLM…")
         response_text, tok_in, tok_out = self._format_response(user_message, sql, columns, rows, summary)
         total_input += tok_in; total_output += tok_out
-        log.info(f"[DataAgent] TOKENS   : input={total_input}  output={total_output}  total={total_input + total_output}")
+        log.info(f"[DataAgent] TOKENS     : input={total_input}  output={total_output}  total={total_input + total_output}")
         log.info("━" * 65)
         return response_text, total_input, total_output
 

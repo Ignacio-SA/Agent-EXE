@@ -1,8 +1,8 @@
 # Asistente Smart-IA — Agent-EXE
 
-Versión empaquetable del asistente de ventas para franquiciados. Franquicia fija configurada en `.env`, sin campo `franchise_id` en la UI ni en la API. Incluye sistema de entrenamiento con feedback de usuarios.
+Versión empaquetable del asistente de ventas para franquiciados. Soporta múltiples franquicias bajo un mismo franquiciado: cuando la consulta es ambigua pregunta al usuario cuál franquicia, y puede comparar franquicias entre sí. Incluye sistema de entrenamiento con feedback de usuarios.
 
-Construido con FastAPI y Claude (Anthropic). Se conecta a Microsoft Fabric Warehouse, carga los datos en SQLite en memoria y responde preguntas de ventas en lenguaje natural.
+Construido con FastAPI y Claude (Anthropic). Modo híbrido: si existe `db_ventas.db` opera 100% local (sin llamadas a SQL Server); si no, se conecta a Microsoft Fabric Warehouse vía SP. En ambos casos carga los datos en SQLite en memoria y responde preguntas de ventas en lenguaje natural.
 
 ## Arquitectura
 
@@ -12,14 +12,20 @@ Cliente (UI Web)
 FastAPI Gateway
     ↓
 Orchestrator Agent (Claude Sonnet — decide qué agente responde)
-    ├→ Comparative Agent  (Haiku — comparativas entre dos períodos)
+    ↓
+Franchise Resolver  (detecta franquicia(s) — sin LLM)
+    ├→ Comparative Agent  (Haiku — comparativas entre períodos o entre franquicias)
     ├→ Data Agent         (Haiku — Text-to-SQL sobre datos de ventas)
     ├→ Interaction Agent  (Haiku — conversación básica del negocio)
     ├→ Training Agent     (Haiku — analiza feedback y genera sugerencias)
     ├→ off_topic          (respuesta fija, 0 tokens)
     └→ Memory Agent       (Haiku — resumen y contexto de sesión)
     ↓
-Microsoft Fabric Warehouse  →  sp_GetSalesForChatbot
+SessionContext ──── DateResolver ──── SalesAnalytics
+(franquicia,        (extrae fecha,     (load_into_memory,
+ fecha, producto)    persiste sesión)   compute_summary)
+    ↓
+MODO LOCAL: db_ventas.db en RAM       MODO REMOTO: sp_GetSalesForChatbot
     ↓
 SQLite en memoria (Text-to-SQL)     SQLite local (memory.db)
 ```
@@ -49,13 +55,12 @@ copy .env.example .env
 ANTHROPIC_API_KEY=sk-ant-...
 
 DB_SERVER=tu-servidor.datawarehouse.fabric.microsoft.com
-DB_NAME=nombre_de_tu_warehouse
+DB_DATABASE=nombre_de_tu_warehouse
 DB_USER=tu@email.com
-DB_AUTH_MODE=interactive
-
+DB_AUTH_MODE=activedirectoryinteractive
 DB_PASSWORD=
 
-FRANCHISE_CODE=4066b2def050495a8fc9ff8c0cb3f8f4
+FRANCHISEE_CODE=fd9e42fa...   # código del franquiciado (dueño), obligatorio en modo remoto
 
 MEMORY_DB_PATH=./memory.db
 ```
@@ -139,14 +144,20 @@ Agent-EXE/
 ├── app/
 │   ├── agents/
 │   │   ├── orchestrator.py       # Clasifica mensajes (comparative/data/interaction/feedback/off_topic)
-│   │   ├── comparative_agent.py  # Comparativas entre dos períodos
+│   │   ├── franchise_resolver.py # Detecta franquicia(s) o pide aclaración al usuario
+│   │   ├── session_context.py    # Estado de sesión: franquicia, fecha, último producto
+│   │   ├── date_resolver.py      # Extrae y persiste rangos de fecha por sesión
+│   │   ├── comparative_agent.py  # Comparativas entre períodos o entre franquicias
 │   │   ├── data_agent.py         # Text-to-SQL sobre ventas
 │   │   ├── interaction.py        # Conversación general del negocio
 │   │   ├── memory_agent.py       # Resumen y contexto de sesión
 │   │   └── training_agent.py     # Analiza feedback y escribe en training_log.md
 │   ├── db/
 │   │   ├── connection.py         # Conexión Azure AD a Fabric (pyodbc)
-│   │   ├── sales_repo.py         # Ejecuta sp_GetSalesForChatbot
+│   │   ├── data_source.py        # Selector híbrido local/remoto
+│   │   ├── local_sales_repo.py   # Carga db_ventas.db en RAM (modo local)
+│   │   ├── sales_repo.py         # Ejecuta sp_GetSalesForChatbot (modo remoto)
+│   │   ├── sales_analytics.py    # load_into_memory() y compute_summary() compartidos
 │   │   ├── memory_repo.py        # SQLite local (sesiones + mensajes + token logs)
 │   │   └── training_repo.py      # TrainingMemory singleton (RAM + training_log.md)
 │   ├── models/
@@ -159,9 +170,13 @@ Agent-EXE/
 │   └── main.py                   # App FastAPI + CORS + rutas
 ├── context/
 │   ├── business_rules.md         # Reglas de negocio (leídas en runtime)
+│   ├── franchise_labels.json     # {franchise_code: "Franquicia N"} — editable sin reiniciar
 │   └── training_log.md           # Log append-only de sugerencias de entrenamiento
 ├── sql/
 │   └── sp_GetSalesForChatbot.sql
+├── csv_to_db.py                  # Convierte CSV exportado de SSMS a db_ventas.db (recomendado)
+├── export_db.py                  # Genera db_ventas.db conectándose al SP directamente
+├── validate_export.py            # Valida que db_ventas.db coincide con el SP
 ├── ui_test/
 │   ├── index.html                # UI principal (Tailwind CSS)
 │   └── Nacho.svg                 # Logo
@@ -184,6 +199,27 @@ Agent-EXE/
 | `interaction` | Saludos, preguntas sobre el chatbot | Bajo |
 | `feedback` | El usuario comenta la respuesta anterior del bot | Bajo |
 | `off_topic` | Sin relación con ventas o el negocio | Cero |
+
+### Franchise Resolver (sin LLM)
+
+Después del Orchestrator, detecta para qué franquicia(s) aplica la consulta:
+
+| Caso | Comportamiento |
+|---|---|
+| Una sola franquicia configurada | Sin ambigüedad, pasa directo |
+| Follow-up a pregunta de aclaración ("la 1", "la primera") | Matching ordinal por posición |
+| Mensaje menciona el nombre de una franquicia | Retorna esa franquicia |
+| Mensaje menciona "ambas" / "las dos" / "comparalas" | Retorna todas |
+| Sesión tiene franquicia previa en SessionContext | La reutiliza en follow-ups |
+| Ambiguo | Pregunta al usuario: "¿Para cuál franquicia? (Franquicia 1 o Franquicia 2)" |
+
+### Módulos compartidos (sin LLM)
+
+| Módulo | Responsabilidad |
+|---|---|
+| `session_context.py` | Singleton en RAM con el estado de sesión: franquicia resuelta, rango de fechas, último artículo consultado |
+| `date_resolver.py` | Extrae fechas por keyword Python → SessionContext → LLM fallback. Guarda el rango resuelto en SessionContext para follow-ups |
+| `sales_analytics.py` | `load_into_memory()` y `compute_summary()` compartidos entre DataAgent y ComparativeAgent |
 
 ### Training Agent (Claude Haiku)
 
@@ -228,8 +264,8 @@ Reglas clave:
 - `pip install azure-identity`
 
 **SP devuelve 0 filas**
-- Verificar que `FRANCHISE_CODE` en `.env` corresponde a `FranchiseCode` (no `FranchiseeCode`) en Fabric
-- Ejecutar `EXEC sp_GetSalesForChatbot @FranchiseCode = 'tu-id'` directo en Fabric
+- Verificar que `FRANCHISEE_CODE` en `.env` corresponde a `FranchiseeCode` (el dueño) en Fabric
+- Ejecutar `EXEC sp_GetSalesForChatbot @FranchiseeCode = 'tu-id'` directo en Fabric
 
 **Error de ODBC Driver**
 ```powershell

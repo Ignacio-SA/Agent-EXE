@@ -15,7 +15,7 @@
 
 ## 1. Visión general
 
-Chatbot de ventas para franquiciados con franquicia fija (configurada en `.env`). El backend es una API FastAPI con sistema multi-agente donde cada agente tiene una responsabilidad específica. Incluye un ciclo de entrenamiento supervisado basado en feedback de usuarios.
+Chatbot de ventas para franquiciados. Soporta N franquicias bajo un mismo franquiciado: resuelve automáticamente la franquicia de cada consulta, pide aclaración cuando es ambiguo y compara franquicias entre sí. El backend es una API FastAPI con sistema multi-agente donde cada agente tiene una responsabilidad específica. Incluye un ciclo de entrenamiento supervisado basado en feedback de usuarios.
 
 ```
 Usuario (UI Web) ──POST /chat──► Orchestrator ──► Agente correcto ──► Respuesta
@@ -31,11 +31,14 @@ Usuario (UI Web) ──POST /chat──► Orchestrator ──► Agente correct
 Agent-EXE/
 ├── app/
 │   ├── main.py                    # Punto de entrada FastAPI
-│   ├── config.py                  # Variables de entorno + franchise_code fijo
+│   ├── config.py                  # Variables de entorno + franchise_map desde JSON
 │   ├── logger.py                  # Logger por sesión → logs/<session_id>.log
 │   ├── agents/
 │   │   ├── orchestrator.py        # Clasifica mensajes en tipos de agente
-│   │   ├── comparative_agent.py   # Comparativas entre dos períodos de ventas
+│   │   ├── franchise_resolver.py  # Detecta franquicia(s) o pide aclaración
+│   │   ├── session_context.py     # ★ Estado de sesión: franquicia, fecha, último producto
+│   │   ├── date_resolver.py       # ★ Extrae y persiste rangos de fecha por sesión
+│   │   ├── comparative_agent.py   # Comparativas entre períodos o entre franquicias
 │   │   ├── data_agent.py          # Text-to-SQL sobre datos de ventas
 │   │   ├── interaction.py         # Conversación general del negocio
 │   │   ├── memory_agent.py        # Resúmenes y contexto de sesión
@@ -45,6 +48,7 @@ Agent-EXE/
 │   │   ├── data_source.py         # ★ Selector híbrido local/remoto — punto de entrada único
 │   │   ├── local_sales_repo.py    # ★ Repositorio local: carga db_ventas.db en RAM
 │   │   ├── sales_repo.py          # Ejecuta sp_GetSalesForChatbot (modo remoto)
+│   │   ├── sales_analytics.py     # ★ load_into_memory() y compute_summary() compartidos
 │   │   ├── memory_repo.py         # CRUD sesiones/mensajes/token-logs (SQLite)
 │   │   └── training_repo.py       # TrainingMemory singleton (RAM + disco)
 │   ├── models/
@@ -54,12 +58,16 @@ Agent-EXE/
 │       └── debug.py               # /debug/query/csv, /debug/query/json, token-logs
 ├── context/
 │   ├── business_rules.md          # Reglas de negocio leídas en runtime
+│   ├── franchise_labels.json      # {franchise_code: label} — hot-reload por mtime
 │   └── training_log.md            # Log append-only de sugerencias de mejora
 ├── sql/
 │   └── sp_GetSalesForChatbot.sql
 ├── ui_test/
 │   ├── index.html                 # UI (Tailwind CSS) con feedback 👍👎
 │   └── Nacho.svg
+├── csv_to_db.py                   # Convierte CSV exportado de SSMS a db_ventas.db
+├── export_db.py                   # Genera db_ventas.db conectándose al SP
+├── validate_export.py             # Valida que db_ventas.db coincide con el SP
 ├── logs/                          # Logs por sesión (auto-generado)
 ├── memory.db                      # SQLite local (auto-generado)
 ├── db_ventas.db                   # ★ Opcional: si existe activa el modo LOCAL
@@ -85,6 +93,14 @@ Agent-EXE/
         │
         ▼
 3. OrchestratorAgent.decide_agent(mensaje, contexto)
+        │
+        ▼
+3b. FranchiseResolver.resolve(mensaje, contexto, franchise_map, agent_type)
+   ├─ clarification → devuelve pregunta al usuario (sin llamar agente)
+   ├─ is_franchise_compare → ComparativeAgent.process_franchise_comparison()
+   └─ resolved_codes → pasa al agente correspondiente
+        │
+        ▼
    ├─ "comparative" → ComparativeAgent.process_comparative_request()
    ├─ "data"        → DataAgent.process_data_request()
    ├─ "interaction" → InteractionAgent.respond()
@@ -107,18 +123,23 @@ Agent-EXE/
 ### Flujo del Data Agent (detalle)
 
 ```
-_extract_date_range()       → Python primero (hoy/ayer/esta semana...), LLM fallback
+DateResolver.resolve()      → Python directo (hoy/ayer/esta semana…)
+                              → SessionContext.get_date() si es follow-up
+                              → LLM fallback para fechas específicas
+                              → Guarda en SessionContext para el próximo turno
         │
-sales_repo.get_sales()      → EXEC sp_GetSalesForChatbot con fecha y franchise_code
+data_source.get_sales()     → LOCAL: RAM  /  REMOTO: sp_GetSalesForChatbot @ Fabric
         │
-_load_into_memory()         → Tabla SQLite en RAM (decodifica DATETIMEOFFSET 20 bytes)
+sales_analytics.load_into_memory()   → SQLite en RAM (decodifica DATETIMEOFFSET si aplica)
         │
-_generate_sql()             → LLM genera SQL SQLite (business_rules + contexto sesión)
+_generate_sql()             → LLM genera SQL SQLite
+                              (business_rules + SessionContext.last_product inyectado)
         │
 _execute_sql()              → Ejecuta contra la tabla en RAM
+                              → Extrae producto mencionado del SQL → SessionContext
         │
-_compute_summary()          → Métricas en Python: transacciones, totales, vendedores,
-                              top productos, horas activas — sin LLM
+sales_analytics.compute_summary()   → Métricas en Python: transacciones, totales,
+                                       vendedores, top productos, horas activas — sin LLM
         │
 _format_response()          → LLM presenta los datos pre-calculados en español
 ```
@@ -147,31 +168,80 @@ Fallback por keywords si el LLM no devuelve JSON válido. Default: `off_topic`.
 
 ### `app/agents/data_agent.py` — El analista (Text-to-SQL)
 
-Pipeline de 7 pasos: extracción de fecha → SP en Fabric → SQLite en RAM → generación SQL → ejecución → cálculo Python → formato LLM.
+Pipeline de 6 pasos: resolución de fecha → obtención de datos → SQLite en RAM → generación SQL → ejecución → formato LLM. La extracción de fechas y el cálculo de métricas viven en módulos compartidos (`date_resolver`, `sales_analytics`).
 
-**Punto crítico — DATETIMEOFFSET:** pyodbc entrega fechas de Fabric como 20 bytes raw. Se decodifican con:
-```python
-struct.unpack('<hHHHHHIhh', v)
-# → year, month, day, hour, minute, second, fraction_ns, tz_h, tz_m
-```
+**Punto crítico — contexto de sesión:** El último artículo consultado se extrae del SQL generado (regex sobre `ArticleDescription`) y se guarda en `SessionContext`. En el siguiente turno, se inyecta como `ÚLTIMO ARTÍCULO/PRODUCTO CONSULTADO` en el contexto de `_generate_sql`, permitiendo preguntas como "y en kilos?" que heredan el producto correcto.
 
-**Punto crítico — contexto de sesión:** El resumen de sesión se inyecta en `_extract_date_range` y `_generate_sql`. Permite preguntas de seguimiento ("haz un desglose por items") sin repetir la fecha.
-
-**Punto crítico — métricas pre-calculadas:** `_compute_summary` calcula todo en Python (sin LLM). El LLM de formato recibe los números definitivos y solo los presenta — nunca recalcula.
+**Punto crítico — métricas pre-calculadas:** `compute_summary()` calcula todo en Python (sin LLM). El LLM de formato recibe los números definitivos y solo los presenta — nunca recalcula.
 
 ---
 
 ### `app/agents/comparative_agent.py` — El comparador
 
-Maneja consultas con dos períodos. Hace un único llamado al SP con el rango completo (min_from → max_to) y filtra en SQLite para cada período. Reutiliza `data_agent._load_into_memory()` y `data_agent._compute_summary()` directamente.
+Maneja consultas con dos períodos. Hace un único llamado a la fuente de datos con el rango completo (min_from → max_to) y filtra en SQLite para cada período. Usa `load_into_memory()` y `compute_summary()` de `sales_analytics.py`, y `date_resolver.resolve()` para extraer fechas. No depende de ningún método privado de `DataAgent`.
 
-**Costo:** 2 LLM calls + 1 SP call (vs. 6 LLM calls + 2 SP calls si se usaran dos data queries separadas).
+**Costo:** 2 LLM calls + 1 llamado a datos (vs. 6 LLM calls + 2 llamados si se usaran dos queries separadas).
+
+---
+
+### `app/agents/session_context.py` — El estado de sesión (sin LLM)
+
+Singleton en RAM que centraliza el estado conversacional por sesión. Evita que cada módulo mantenga su propio dict de sesión y que se busquen datos en texto del historial.
+
+| Campo | Tipo | Qué guarda |
+|---|---|---|
+| `franchise` | `list[str]` | Códigos de franquicia resueltos en el último turno |
+| `date` | `(datetime, datetime, str)` | Rango de fechas y filtro SQL del último período explícito |
+| `last_product` | `str` | Último artículo consultado (extraído del SQL generado) |
+
+`chat.py` lee/escribe `franchise`. `DateResolver` lee/escribe `date`. `DataAgent` lee/escribe `last_product`.
+
+---
+
+### `app/agents/date_resolver.py` — El extractor de fechas (0-1 LLM calls)
+
+Extrae el rango de fechas de un mensaje. Retorna `(date_from, date_to, date_filter, tok_in, tok_out, clarification)`.
+
+Lógica en orden de prioridad (sin LLM hasta el paso 3):
+1. Keywords directos (`hoy`, `ayer`, `esta semana`, `semana pasada`, `este mes`) → 0 tokens
+2. Follow-up detectado + `SessionContext.get_date()` disponible → reutiliza fecha guardada, 0 tokens
+3. LLM fallback (Haiku) → extrae fecha del mensaje o contexto
+
+**Detección de follow-up:** usa regex `\b\d{2}[/\-]\d{2}` para detectar fechas reales — evita dispararse con fracciones como "1/4 Kilo" o "1/2 Kilo" (que solo tienen 1 dígito por lado).
+
+Después de resolver, guarda en `SessionContext.set_date()` para que el próximo turno no necesite buscar fechas en texto del historial.
+
+---
+
+### `app/db/sales_analytics.py` — Analítica de ventas compartida (sin LLM)
+
+Módulo con dos funciones puras usadas por `DataAgent` y `ComparativeAgent`:
+
+- **`load_into_memory(sales)`**: carga una lista de dicts en SQLite en RAM. Calcula `DiaSemana`. Decodifica `DATETIMEOFFSET` de 20 bytes (modo remoto).
+- **`compute_summary(conn, date_filter, period_label, franchise_map)`**: calcula en Python (sin LLM) transacciones, totales, ticket promedio, desglose por vendedor, top productos y horas activas. El LLM de formato recibe estos números y solo los presenta.
+
+Antes de este módulo, `ComparativeAgent` llamaba directamente a `data_agent._load_into_memory()` y `data_agent._compute_summary()` — acoplamiento frágil que se eliminó.
+
+---
+
+### `app/agents/franchise_resolver.py` — El selector de franquicia (sin LLM)
+
+Corre después del Orchestrator, sin costo de tokens. Recibe `(mensaje, contexto, franchise_map, agent_type, session_franchise)` y retorna `(franchise_codes, clarification, is_franchise_compare)`.
+
+Lógica en orden de prioridad:
+1. Una sola franquicia → sin ambigüedad
+2. Contexto tiene pregunta de aclaración previa → matching ordinal ("la 1", "primera", "2", "segunda")
+3. Mensaje menciona todas las franquicias o keyword de comparación → todas
+4. Mensaje menciona un label específico → esa franquicia
+5. Contexto previo usó una sola franquicia → hereda esa
+6. `session_franchise` (desde `SessionContext`) → reutiliza franquicia del turno anterior
+7. Ambiguo + agent_type data/comparative → devuelve `clarification` al usuario
 
 ---
 
 ### `app/agents/interaction.py` — El recepcionista
 
-Haiku con `max_tokens=200`. Responde saludos y preguntas sobre el chatbot. Si el mensaje mezcla contenido de negocio con off-topic, responde solo la parte del negocio e ignora el resto.
+Haiku con `max_tokens=500`. Responde saludos y preguntas sobre el chatbot. Si el mensaje mezcla contenido de negocio con off-topic, responde solo la parte del negocio e ignora el resto.
 
 ---
 
@@ -227,7 +297,7 @@ El token Azure AD se reutiliza (singleton `_credential`) entre requests para no 
 
 ### `app/config.py` — Configuración
 
-Incluye `franchise_code` como campo fijo (leído de `.env`, default al código de la franquicia de prueba). En esta versión EXE no hay `franchise_id` dinámico ni en la API ni en la UI.
+`franchisee_code` leído de `FRANCHISEE_CODE` (o `FRANCHISE_CODE` como fallback). `franchise_map` es una property que lee `context/franchise_labels.json` con cache por mtime — se recarga automáticamente si el archivo cambia, sin reiniciar la app.
 
 ---
 
@@ -245,7 +315,13 @@ Reglas clave:
 
 ### `sql/sp_GetSalesForChatbot.sql` — El Stored Procedure
 
-Corre en Microsoft Fabric Warehouse. Usa 5 CTEs con `CROSS APPLY OPENJSON` para extraer datos de columnas JSON. Filtra por `h.FranchiseCode` (no `h.FranchiseeCode` — son columnas distintas).
+Corre en Microsoft Fabric Warehouse. Usa 5 CTEs con `CROSS APPLY OPENJSON` para extraer datos de columnas JSON.
+
+Parámetros:
+- `@FranchiseeCode` (obligatorio) — filtra `WHERE h.FranchiseeCode = @FranchiseeCode` (el dueño)
+- `@FranchiseCodes` (opcional, CSV) — filtra adicionalmente por `h.FranchiseCode IN (STRING_SPLIT(...))`; NULL = todos los locales del dueño
+
+Retorna ambas columnas: `h.FranchiseeCode` (el dueño) y `h.FranchiseCode` (el local). El bot agrupa por `FranchiseCode` para distinguir franquicias.
 
 El filtro de fecha usa el header (`h.DateTimeUtc`), no el detalle, para evitar perder tickets donde header y detalle caen en días distintos.
 
@@ -352,12 +428,12 @@ id | session_id | user_message | agent_type | input_tokens | output_tokens | tot
 | Variable | Requerida | Descripción |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Sí | API key de Anthropic |
-| `DB_SERVER` | Sí | Host del Fabric Warehouse |
-| `DB_NAME` | Sí | Nombre de la base de datos |
-| `DB_USER` | Sí | Email Azure AD |
+| `DB_SERVER` | Solo modo remoto | Host del Fabric Warehouse |
+| `DB_DATABASE` | Solo modo remoto | Nombre de la base de datos (acepta también `DB_NAME`) |
+| `DB_USER` | Solo modo remoto | Email Azure AD |
 | `DB_PASSWORD` | Solo si `DB_AUTH_MODE=sql` | Contraseña SQL |
-| `DB_AUTH_MODE` | No (default: `sql`) | `interactive` / `activedirectoryintegrated` / `sql` |
-| `FRANCHISE_CODE` | No (default en config.py) | Código fijo de franquicia |
+| `DB_AUTH_MODE` | No (default: `sql`) | `activedirectoryinteractive` / `activedirectoryintegrated` / `sql` |
+| `FRANCHISEE_CODE` | Solo modo remoto | Código del franquiciado (dueño); acepta también `FRANCHISE_CODE` |
 | `MEMORY_DB_PATH` | No (default: `./memory.db`) | Ruta del SQLite local |
 
 ---
@@ -387,9 +463,17 @@ Las sugerencias son generadas por un LLM y pueden ser incorrectas. Un ciclo de r
 `chatbot_memory` (resumen): inyectado como contexto en cada request — compacto, pocos tokens.
 `chat_messages` (historial completo): permite reconstruir la conversación en la UI cuando el usuario carga una sesión anterior.
 
-### ¿Por qué el ComparativeAgent reutiliza métodos del DataAgent?
+### ¿Por qué `SalesAnalytics`, `DateResolver` y `SessionContext` son módulos separados?
 
-`_load_into_memory` y `_compute_summary` son lógica de datos pura. Cualquier mejora futura al cálculo de métricas beneficia a ambos agentes automáticamente. Un solo SP call cubre el rango completo de ambos períodos — la mitad de round-trips a Fabric vs. dos queries separadas.
+**SalesAnalytics**: `load_into_memory` y `compute_summary` son lógica de datos pura sin dependencias de agentes. Extraerlos elimina el acoplamiento donde `ComparativeAgent` llamaba a métodos privados de `DataAgent`. Cualquier mejora al cálculo de métricas beneficia a ambos agentes automáticamente.
+
+**DateResolver**: `_extract_date_range` era un método de 130 líneas dentro de `DataAgent`. Al extraerlo, tanto `DataAgent` como `ComparativeAgent` pueden resolver fechas de forma independiente y consistente, usando la misma lógica de follow-up y el mismo `SessionContext`.
+
+**SessionContext**: antes, `_session_franchise` vivía en `chat.py` y `_session_dates` vivía en `data_agent.py`. Centralizar el estado de sesión en un único singleton elimina la duplicación, hace el estado auditable en un solo lugar, y permite que `last_product` sea accesible sin acoplar los agentes entre sí.
+
+### ¿Por qué persistir la fecha resuelta en SessionContext en vez de buscar en el contexto de memoria?
+
+Buscar fechas en texto del historial (el enfoque anterior) propagaba errores: si el bot respondía "período 25/03 al 31/03" cuando el usuario pedía "marzo", esa fecha incorrecta se guardaba en memoria y contaminaba todos los follow-ups. `DateResolver` guarda la fecha que él mismo resolvió — nunca la que el LLM de formato escribió en su respuesta.
 
 ### ¿Por qué el filtro de fecha usa `h.DateTimeUtc` y no `d.SaleDateTimeUtc` en el SP?
 
@@ -478,22 +562,28 @@ Donde `exe_dir` es:
 Esquema mínimo esperado:
 ```sql
 CREATE TABLE ventas (
-    id               TEXT,
-    FranchiseeCode   TEXT,
-    ShiftCode        TEXT,
-    PosCode          TEXT,
-    UserName         TEXT,
-    SaleDateTimeUtc  TEXT,   -- ISO string: '2025-03-15 14:23:00.000000'
-    Quantity         REAL,
-    ArticleId        TEXT,
+    id                 TEXT,
+    FranchiseeCode     TEXT,   -- código del dueño (mismo para todas las filas)
+    FranchiseCode      TEXT,   -- código del local (distingue Franquicia 1 / Franquicia 2)
+    Franquicia         TEXT,   -- "1" o "2" — posición en franchise_labels.json (generado por export_db.py)
+    ShiftCode          TEXT,
+    PosCode            TEXT,
+    UserName           TEXT,   -- anonimizado como "Colaborador N" por export_db.py
+    SaleDateTimeUtc    TEXT,   -- ISO string: '2025-03-15 14:23:00.000000' (UTC-3)
+    Quantity           TEXT,
+    ArticleId          TEXT,
     ArticleDescription TEXT,
-    TypeDetail       TEXT,
-    UnitPriceFix     REAL
-    -- ... resto de columnas del SP
+    TypeDetail         TEXT,
+    UnitPriceFix       TEXT,
+    Type               TEXT,
+    CtaChannel         TEXT,
+    VtaOperation       TEXT,
+    Plataforma         TEXT,
+    FormaPago          TEXT
 );
 ```
 
-> **Nota:** `LocalSalesRepository` también intentará filtrar por `FranchiseCode` (sin "e") si `FranchiseeCode` no existe, para mayor compatibilidad.
+`LocalSalesRepository` filtra y agrupa por `FranchiseCode` (el local). `FranchiseeCode` queda disponible pero no se usa para grouping.
 
 ---
 

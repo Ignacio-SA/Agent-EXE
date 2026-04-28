@@ -5,7 +5,9 @@
 | Columna            | Tipo    | Descripción                                      |
 |--------------------|---------|--------------------------------------------------|
 | id                 | TEXT    | Identificador único de la transacción (puede repetirse si hay múltiples ítems en una venta) |
-| FranchiseeCode     | TEXT    | Código interno del franquiciado                  |
+| FranchiseeCode     | TEXT    | Código del franquiciado (dueño) — mismo valor en todas las filas |
+| FranchiseCode      | TEXT    | Código de la franquicia (local) — identifica Franquicia 1, Franquicia 2, etc. |
+| Franquicia         | TEXT    | Número ordinal del local: "1", "2", etc. — según el orden en franchise_labels.json |
 | ShiftCode          | TEXT    | Código de turno                                  |
 | PosCode            | TEXT    | Código del punto de venta (POS)                  |
 | UserName           | TEXT    | Nombre del vendedor                              |
@@ -20,6 +22,8 @@
 | VtaOperation       | TEXT    | Tipo de operación: 'Socios' (ClubGrido) o 'No Socios' |
 | Plataforma         | TEXT    | Plataforma delivery: 'PediGrido', 'PedidosYa', 'Rappi'. NULL si es venta directa |
 | FormaPago          | TEXT    | Medio de pago del ticket. Valores conocidos: 'Efectivo', 'Mercado Pago', 'Tarjeta de Débito', 'Tarjeta de Crédito', 'Transferencia', 'Múltiples medios de pago' (si usó más de uno). NULL si sin datos |
+| WeightKilos        | REAL    | Peso en kilos por unidad del artículo. NULL o vacío si el artículo no tiene peso definido (servicios, ítems sin datos de catálogo) |
+| DiaSemana          | TEXT    | Día de la semana en español derivado de `SaleDateTimeUtc`. Valores: `'Lunes'`, `'Martes'`, `'Miércoles'`, `'Jueves'`, `'Viernes'`, `'Sábado'`, `'Domingo'` |
 
 ---
 
@@ -81,6 +85,92 @@ GROUP BY ArticleDescription
 
 ---
 
+## Columna `DiaSemana` — análisis por día de la semana
+
+**Valores posibles:** `'Lunes'`, `'Martes'`, `'Miércoles'`, `'Jueves'`, `'Viernes'`, `'Sábado'`, `'Domingo'`
+
+**SIEMPRE** ordenar por día cronológico (no alfabético):
+```sql
+ORDER BY CASE DiaSemana
+    WHEN 'Lunes'     THEN 1
+    WHEN 'Martes'    THEN 2
+    WHEN 'Miércoles' THEN 3
+    WHEN 'Jueves'    THEN 4
+    WHEN 'Viernes'   THEN 5
+    WHEN 'Sábado'    THEN 6
+    WHEN 'Domingo'   THEN 7
+END
+```
+
+**Ejemplo — día más productivo (transacciones):**
+```sql
+SELECT DiaSemana,
+       COUNT(DISTINCT id) AS transacciones,
+       ROUND(SUM(CAST(Quantity AS REAL) * CAST(UnitPriceFix AS REAL)), 2) AS total
+FROM ventas
+WHERE "Type" != '2'
+GROUP BY DiaSemana
+ORDER BY transacciones DESC
+```
+
+**Ejemplo — comparar por día de semana entre franquicias:**
+```sql
+SELECT Franquicia, DiaSemana,
+       COUNT(DISTINCT id) AS transacciones,
+       ROUND(SUM(CAST(Quantity AS REAL) * CAST(UnitPriceFix AS REAL)), 2) AS total
+FROM ventas
+WHERE "Type" != '2'
+GROUP BY Franquicia, DiaSemana
+ORDER BY Franquicia,
+         CASE DiaSemana WHEN 'Lunes' THEN 1 WHEN 'Martes' THEN 2
+           WHEN 'Miércoles' THEN 3 WHEN 'Jueves' THEN 4 WHEN 'Viernes' THEN 5
+           WHEN 'Sábado' THEN 6 WHEN 'Domingo' THEN 7 END
+```
+
+---
+
+## Columna `WeightKilos` — kilos vendidos
+
+Peso en kilos por **unidad** del artículo. Puede ser `NULL` o `''` si el artículo no tiene peso en el catálogo.
+
+**Para calcular kilos:** `SUM(CAST(Quantity AS REAL) * CAST(WeightKilos AS REAL))`
+
+**SIEMPRE** filtrar artículos sin peso: `AND WeightKilos IS NOT NULL AND WeightKilos != ''`
+
+**Ejemplo — kilos totales:**
+```sql
+SELECT ROUND(SUM(CAST(Quantity AS REAL) * CAST(WeightKilos AS REAL)), 2) AS kilos_total
+FROM ventas
+WHERE "Type" != '2' AND WeightKilos IS NOT NULL AND WeightKilos != ''
+```
+
+**Ejemplo — kilos por día de semana:**
+```sql
+SELECT DiaSemana,
+       ROUND(SUM(CAST(Quantity AS REAL) * CAST(WeightKilos AS REAL)), 2) AS kilos
+FROM ventas
+WHERE "Type" != '2' AND WeightKilos IS NOT NULL AND WeightKilos != ''
+GROUP BY DiaSemana
+ORDER BY CASE DiaSemana WHEN 'Lunes' THEN 1 WHEN 'Martes' THEN 2
+           WHEN 'Miércoles' THEN 3 WHEN 'Jueves' THEN 4 WHEN 'Viernes' THEN 5
+           WHEN 'Sábado' THEN 6 WHEN 'Domingo' THEN 7 END
+```
+
+**Ejemplo — kilos por día de semana por franquicia:**
+```sql
+SELECT Franquicia, DiaSemana,
+       ROUND(SUM(CAST(Quantity AS REAL) * CAST(WeightKilos AS REAL)), 2) AS kilos
+FROM ventas
+WHERE "Type" != '2' AND WeightKilos IS NOT NULL AND WeightKilos != ''
+GROUP BY Franquicia, DiaSemana
+ORDER BY Franquicia,
+         CASE DiaSemana WHEN 'Lunes' THEN 1 WHEN 'Martes' THEN 2
+           WHEN 'Miércoles' THEN 3 WHEN 'Jueves' THEN 4 WHEN 'Viernes' THEN 5
+           WHEN 'Sábado' THEN 6 WHEN 'Domingo' THEN 7 END
+```
+
+---
+
 ## REGLA DE PRESENTACIÓN: Cómo mostrar resultados al usuario
 
 El usuario es un **franquiciado o vendedor**, no un analista ni desarrollador. Las respuestas deben ser claras y comerciales.
@@ -97,7 +187,9 @@ El usuario es un **franquiciado o vendedor**, no un analista ni desarrollador. L
 |--------------------------|----------------------------------------------------|
 | Ítems con Type=1         | "Productos vendidos" o simplemente listarlos       |
 | Fila con Type=2          | "Promoción aplicada: [descripción de la promo]"    |
-| FranchiseeCode           | Omitir o mostrar como "Franquicia"                 |
+| FranchiseeCode           | Omitir (es el código del dueño, no relevante para el usuario) |
+| FranchiseCode            | Mostrar como el nombre del local (ver franchise_labels.json)  |
+| Franquicia               | Omitir (uso interno para agrupación)              |
 | ShiftCode                | "Turno"                                            |
 | PosCode                  | "Caja" o "Punto de venta"                          |
 | UserName                 | "Vendedor/a"                                       |
@@ -107,6 +199,8 @@ El usuario es un **franquiciado o vendedor**, no un analista ni desarrollador. L
 | VtaOperation             | "Operación Socios" / "No Socios"                   |
 | Plataforma               | Mostrar tal cual (PedidosYa, PediGrido, Rappi)     |
 | FormaPago                | "Medio de pago"                                    |
+| WeightKilos / kilos      | Mostrar como "X.XX kg" (ej: "12.50 kg"). Si es total grande, redondear a 2 decimales |
+| DiaSemana                | Mostrar tal cual (ya está en español). Nunca mostrar el número de día |
 
 ### Cómo presentar franjas horarias:
 No mostrar el número de hora crudo. Convertirlo a rango legible:
